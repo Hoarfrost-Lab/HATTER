@@ -1,10 +1,9 @@
 
-![hatter-logo](https://github.com/Hoarfrost-Lab/HATTER/blob/main/assets/HATTER-logo.png)
 # HATTER: Human-in-the-loop Adaptive Toolkit for Transferable Enzyme Representations
 
-This repository serves as the official release 1.0 of the multi-agent system proposed by Babjac and Hoarfrost et. al. as described in "Active Learning in Wonderland — A Toolkit for Curious Machines and Curious Biologists". 
+This repository serves as the official release 1.0 of the multi-agent system proposed by Babjac and Hoarfrost et. al. as described in "An Active Learning Framework for Data-Efficient Human-in-the-Loop Enzyme Function Prediction". 
 
-![hatter-pipeline](https://github.com/Hoarfrost-Lab/HATTER/blob/main/assets/HATTER-pipeline.png)
+![hatter-pipeline](https://github.com/Hoarfrost-Lab/HATTER/blob/main/assets/HATTER_diagram(3).png)
 
 **Additional Features**
 
