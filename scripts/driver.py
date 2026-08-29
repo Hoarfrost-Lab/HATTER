@@ -34,6 +34,8 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Train a functional prediction model with various choices')
     parser.add_argument('--acquisition_space', type=str, default='embedding', choices=['embedding', 'distance'], help="What the acquisition functions score. 'embedding' (default) is the original behaviour: a softmax over the 128-d contrastive embedding, which is near-uniform for every sequence and gives a degenerate signal. 'distance' scores the negated distance to each EC cluster centre, a real posterior over ECs. Row selection is unchanged either way.")
+    parser.add_argument('--no_format_esm', dest='format_esm', action='store_false', help="Treat cached .pt embeddings as bare tensors rather than ESM extract.py's dict output. Default is to unwrap via format_esm(), which is correct for anything produced by esm/scripts/extract.py. Previously this was wired to --use_old_naming_convention, an unrelated flag controlling cache filenames.")
+    parser.set_defaults(format_esm=True)
     parser.add_argument('--acquisition_temperature', type=float, default=1.0, help='Softmax temperature on the negated squared EC-centroid distances. Only used with --acquisition_space distance. CLEAN is trained with a triplet margin rather than a prototypical softmax, so its distance scale is not calibrated for one; T<1 sharpens a posterior that comes out too flat.')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed for numpy, torch, CLEAN and dal_toolbox. Was previously hardcoded to 1234, which made replicate runs impossible.')
     parser.add_argument('--mode', type=str, required=True, choices=['init', 'update', 'train', 'inference', 'simulation'], default='simulation', help='Stage of active learning. Init mode is for the initial points to run the experiment. Update mode is for after the experiment to query the next set of points. Train mode is simply to pre-train the model if using custom data (will not perform any active learning). Pre-training can also be done in init mode by specifying --perform_pretraining.')
@@ -287,7 +289,7 @@ if __name__ == "__main__":
                                                             eval_filename=valid_data_name, 
                                                             batch_size=args.batch_size, 
                                                             shuffle=True,
-                                                            _format_esm=args.use_old_naming_convention,
+                                                            _format_esm=args.format_esm,
                                                             maxsep=maxsep,
                                                             loss=args.loss,
                                                             model_name=args.plot_name)
@@ -317,7 +319,7 @@ if __name__ == "__main__":
                     emb_dir=args.emb_path, 
                     cache_dir=args.cache_path, 
                     knn=args.knn, 
-                    _format_esm=args.use_old_naming_convention,
+                    _format_esm=args.format_esm,
                     model_name=args.plot_name)
 
         #-------------------------------evaluate pretraining performance--------------------------------#
@@ -333,7 +335,7 @@ if __name__ == "__main__":
                                 metrics_save_path=test_data_name+'_lowest_loss_metrics.json',
                                 train_emb=reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict),
                                 emb_out_dir=args.emb_path,
-                                _format_esm=args.use_old_naming_convention,
+                                _format_esm=args.format_esm,
                                 maxsep=maxsep,
                                 model_name=args.plot_name)
 
@@ -355,7 +357,7 @@ if __name__ == "__main__":
                          metrics_save_path=test_data_name+'_metrics.json',
                          train_emb=reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict),
                          emb_out_dir=args.emb_path,
-                         _format_esm=args.use_old_naming_convention,
+                         _format_esm=args.format_esm,
                          maxsep=maxsep,
                          model_name=args.plot_name)
 
@@ -428,7 +430,7 @@ if __name__ == "__main__":
                                    label_encoder=le, 
                                    plot_tuple=plot_tuple, 
                                    model_name=args.plot_name,
-                                   _format_esm=args.use_old_naming_convention,
+                                   _format_esm=args.format_esm,
                                    save_recomputed_embeddings=args.save_recomputed_embeddings) #not supported yet
 
         if args.checkpoint_and_eval and lowest_loss_model != None:
@@ -443,7 +445,7 @@ if __name__ == "__main__":
                                 metrics_save_path=test_data_name+'_lowest_loss_metrics.json',
                                 train_emb=reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict),
                                 emb_out_dir=args.emb_path,
-                                _format_esm=args.use_old_naming_convention,
+                                _format_esm=args.format_esm,
                                 maxsep=maxsep,
                                 model_name=args.plot_name)
 
@@ -458,7 +460,7 @@ if __name__ == "__main__":
                          metrics_save_path=test_data_name+'_metrics.json',
                          train_emb=reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict),
                          emb_out_dir=args.emb_path,
-                         _format_esm=args.use_old_naming_convention,
+                         _format_esm=args.format_esm,
                          maxsep=maxsep,
                          model_name=args.plot_name)
 
