@@ -159,7 +159,7 @@ if __name__ == "__main__":
     if args.train_csv_path is not None:
         train_data_name, train_data_path, train_datamodule = get_full_data_module(args.train_csv_path,
                                                                                   batch_size=args.batch_size,
-                                                                                  precomputed=True, #FIXME
+                                                                                  precomputed=args.precomputed,
                                                                                   shuffle=True,
                                                                                   seed=RANDOM_STATE_SEED,
                                                                                   emb_dir=args.emb_path, #not supported yet 
@@ -178,13 +178,13 @@ if __name__ == "__main__":
     #get pool data if specified
     if args.pool_csv_path is not None and args.mode == 'init':
         pool_data_name, pool_data_path, pool_datamodule = get_validation_only_data_module(args.pool_csv_path, 
-                                                                                precomputed=True, #FIXME 
+                                                                                precomputed=args.precomputed, 
                                                                                 emb_dir=args.emb_path)
 
     elif args.pool_csv_path is not None and args.mode == 'simulation':
         pool_data_name, pool_data_path, pool_datamodule = get_full_data_module(args.pool_csv_path,
                                                                                   batch_size=args.batch_size,
-                                                                                  precomputed=True, #FIXME
+                                                                                  precomputed=args.precomputed,
                                                                                   shuffle=False, #I dont think it should shuffle because it will mess with the AL
                                                                                   seed=RANDOM_STATE_SEED,
                                                                                   emb_dir=args.emb_path, #not supported yet 
@@ -196,7 +196,7 @@ if __name__ == "__main__":
     elif args.pool_csv_path is not None and args.mode == 'update':
         pool_data_name, pool_data_path, pool_datamodule = get_full_data_module(args.pool_csv_path,
                                                                                batch_size=args.batch_size,
-                                                                               precomputed=True, #FIXME
+                                                                               precomputed=args.precomputed,
                                                                                shuffle=False, #FIXME: not sure about this...need to think about it
                                                                                seed=RANDOM_STATE_SEED,
                                                                                emb_dir=args.emb_path,
@@ -227,7 +227,7 @@ if __name__ == "__main__":
     if args.valid_csv_path is not None and (args.mode == 'train' or args.perform_pretraining or args.perform_active_learning_pretraining) and args.checkpoint_and_eval:
         valid_data_name, valid_data_path, valid_datamodule = get_full_data_module(args.valid_csv_path,
                                                                                   batch_size=args.batch_size,
-                                                                                  precomputed=True, #FIXME
+                                                                                  precomputed=args.precomputed,
                                                                                   shuffle=False,
                                                                                   seed=RANDOM_STATE_SEED,
                                                                                   emb_dir=args.emb_path,
@@ -241,7 +241,7 @@ if __name__ == "__main__":
 
     elif args.valid_csv_path is not None:
         valid_data_name, valid_data_path, valid_datamodule = get_validation_only_data_module(args.valid_csv_path, 
-                                                                                            precomputed=True, #FIXME 
+                                                                                            precomputed=args.precomputed, 
                                                                                             emb_dir=args.emb_path)
         eval_dataloader = None
 
