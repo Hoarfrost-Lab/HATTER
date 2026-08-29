@@ -170,6 +170,24 @@ def train_CLEAN_model_AL(model, criterion, optimizer, al_strat, train_datamodule
 _CENTROID_BATCH = 8192
 
 
+def apply_labeled_scope(pool_datamodule, train_datamodule):
+    """Restrict the pool dataset's contrastive mining to train + acquired.
+
+    No-op unless --mining_scope labeled is in effect (which sets
+    _use_labeled_mining on the datamodule). Must be re-applied after every
+    random_init / update_annotations, since the labelled set grows each round.
+    """
+    if not getattr(pool_datamodule, '_use_labeled_mining', False):
+        return
+    ds = getattr(pool_datamodule, 'train_dataset', None)
+    if ds is None or not hasattr(ds, 'set_labeled_scope'):
+        return
+    full_list = pool_datamodule.query_dataset.full_list
+    labeled_ids = [full_list[i] for i in pool_datamodule.labeled_indices]
+    ds.set_labeled_scope(labeled_ids,
+                         train_id_ec=getattr(train_datamodule, 'id_ec', None),
+                         train_ec_id=getattr(train_datamodule, 'ec_id', None))
+
 def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
     """EC cluster centres over everything currently LABELLED.
 
@@ -304,6 +322,7 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
 
     pool_datamodule.random_init(n_samples=n_instances)
     indices = pool_datamodule.labeled_indices
+    apply_labeled_scope(pool_datamodule, train_datamodule)
 
     break_early = False
     exit_round = False
@@ -335,6 +354,7 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
             print(scores)
 
             pool_datamodule.update_annotations(indices)
+            apply_labeled_scope(pool_datamodule, train_datamodule)
 
         #model.reset_states()
         model.to(device)

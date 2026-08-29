@@ -36,6 +36,7 @@ if __name__ == "__main__":
     parser.add_argument('--acquisition_space', type=str, default='embedding', choices=['embedding', 'distance'], help="What the acquisition functions score. 'embedding' (default) is the original behaviour: a softmax over the 128-d contrastive embedding, which is near-uniform for every sequence and gives a degenerate signal. 'distance' scores the negated distance to each EC cluster centre, a real posterior over ECs. Row selection is unchanged either way.")
     parser.add_argument('--no_format_esm', dest='format_esm', action='store_false', help="Treat cached .pt embeddings as bare tensors rather than ESM extract.py's dict output. Default is to unwrap via format_esm(), which is correct for anything produced by esm/scripts/extract.py. Previously this was wired to --use_old_naming_convention, an unrelated flag controlling cache filenames.")
     parser.set_defaults(format_esm=True)
+    parser.add_argument('--mining_scope', type=str, default='labeled', choices=['labeled', 'pool'], help="Where contrastive positives and negatives are drawn from during simulation. 'labeled' (default) uses train plus already-acquired pool points only; an EC with a single labelled member self-mutates until a second arrives. 'pool' restores the original behaviour, which mined from the whole pool and thereby used EC labels of unacquired data.")
     parser.add_argument('--acquisition_temperature', type=float, default=1.0, help='Softmax temperature on the negated squared EC-centroid distances. Only used with --acquisition_space distance. CLEAN is trained with a triplet margin rather than a prototypical softmax, so its distance scale is not calibrated for one; T<1 sharpens a posterior that comes out too flat.')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed for numpy, torch, CLEAN and dal_toolbox. Was previously hardcoded to 1234, which made replicate runs impossible.')
     parser.add_argument('--mode', type=str, required=True, choices=['init', 'update', 'train', 'inference', 'simulation'], default='simulation', help='Stage of active learning. Init mode is for the initial points to run the experiment. Update mode is for after the experiment to query the next set of points. Train mode is simply to pre-train the model if using custom data (will not perform any active learning). Pre-training can also be done in init mode by specifying --perform_pretraining.')
@@ -385,6 +386,9 @@ if __name__ == "__main__":
     if args.acquisition_space == 'distance':
         model._use_distance_logits = True
         model.acquisition_temperature = args.acquisition_temperature
+
+    if args.mining_scope == 'labeled' and pool_datamodule is not None:
+        pool_datamodule._use_labeled_mining = True
 
     if args.mode == 'simulation': 
         if args.generate_plots:
