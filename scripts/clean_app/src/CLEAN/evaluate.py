@@ -326,3 +326,29 @@ def get_eval_metrics(pred_label, pred_probs, true_label, all_label):
     acc = accuracy_score(true_m, pred_m)
     bacc = balanced_accuracy_score(true_m.argmax(axis=1), pred_m.argmax(axis=1))
     return pre, rec, f1, auc, prc, acc, bacc
+
+
+def write_max_sep_choices_topk(test_ids, ec_names, topk_vals, topk_idx, csv_name,
+                               first_grad=True, use_max_grad=False, gmm=None):
+    """CSV-identical replacement for write_max_sep_choices, from top-k arrays.
+
+    maximum_separation only inspects the 10 smallest distances, so operating on
+    the top-k loses nothing. Output format is byte-identical to the original:
+        <entry>,EC:<ec>/<dist:.4f>,...
+    """
+    with open(csv_name + '_maxsep.csv', 'w', newline='') as out_file:
+        csvwriter = csv.writer(out_file, delimiter=',')
+        for row, entry in enumerate(test_ids):
+            dist_lst = list(topk_vals[row])
+            max_sep_i = maximum_separation(np.array(dist_lst), first_grad, use_max_grad)
+            ec = []
+            for i in range(max_sep_i + 1):
+                EC_i = ec_names[topk_idx[row][i]]
+                dist_i = topk_vals[row][i]
+                if gmm is not None:
+                    gmm_lst = pickle.load(open(gmm, 'rb'))
+                    dist_i = infer_confidence_gmm(dist_i, gmm_lst)
+                ec.append('EC:' + str(EC_i) + '/' + "{:.4f}".format(dist_i))
+            ec.insert(0, entry)
+            csvwriter.writerow(ec)
+    return
