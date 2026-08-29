@@ -34,6 +34,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Train a functional prediction model with various choices')
     parser.add_argument('--acquisition_space', type=str, default='embedding', choices=['embedding', 'distance'], help="What the acquisition functions score. 'embedding' (default) is the original behaviour: a softmax over the 128-d contrastive embedding, which is near-uniform for every sequence and gives a degenerate signal. 'distance' scores the negated distance to each EC cluster centre, a real posterior over ECs. Row selection is unchanged either way.")
+    parser.add_argument('--acquisition_temperature', type=float, default=1.0, help='Softmax temperature on the negated squared EC-centroid distances. Only used with --acquisition_space distance. CLEAN is trained with a triplet margin rather than a prototypical softmax, so its distance scale is not calibrated for one; T<1 sharpens a posterior that comes out too flat.')
     parser.add_argument('--seed', type=int, default=1234, help='Random seed for numpy, torch, CLEAN and dal_toolbox. Was previously hardcoded to 1234, which made replicate runs impossible.')
     parser.add_argument('--mode', type=str, required=True, choices=['init', 'update', 'train', 'inference', 'simulation'], default='simulation', help='Stage of active learning. Init mode is for the initial points to run the experiment. Update mode is for after the experiment to query the next set of points. Train mode is simply to pre-train the model if using custom data (will not perform any active learning). Pre-training can also be done in init mode by specifying --perform_pretraining.')
     parser.add_argument('--active_type', type=str, choices=['uncertainty_sampling', 'entropy_sampling', 'margin_sampling', 'random_sampling', 'bayesian', 'BALD', 'BADGE', 'typiclust', 'QBC', 'bio-inspired'], required=True, help='Type of embedding to use')
@@ -381,6 +382,7 @@ if __name__ == "__main__":
     # construction sites above, so set the flag here where all paths converge.
     if args.acquisition_space == 'distance':
         model._use_distance_logits = True
+        model.acquisition_temperature = args.acquisition_temperature
 
     if args.mode == 'simulation': 
         if args.generate_plots:

@@ -48,6 +48,14 @@ class DeterministicCLEANModel(DeterministicModel):
         # real class axis. See set_ec_centroids().
         self.ec_centroids = None
 
+        # Softmax temperature applied to the negated squared distances. CLEAN's
+        # embedding is trained with a triplet margin, not with a prototypical
+        # softmax, so its absolute distance scale is not calibrated for one.
+        # If distances are small relative to the class count the posterior goes
+        # flat again; T<1 sharpens it. Diagnose before tuning: measure the
+        # entropy of the resulting posterior against log(n_ec).
+        self.acquisition_temperature = 1.0
+
     def set_ec_centroids(self, centroids):
         """Supply EC cluster centres so acquisition scores mean something.
 
@@ -59,10 +67,25 @@ class DeterministicCLEANModel(DeterministicModel):
         is within ~2% of maximum entropy for EVERY sequence, so the acquisition
         signal is degenerate and the ranking is essentially noise.
 
-        Passing the negated distance to each EC centre restores a genuine
-        posterior over ECs, which is also what CLEAN itself predicts from
-        (infer_maxsep / infer_pvalue). Selection remains per-row throughout:
-        the strategies still return one score per pool instance.
+        Passing the negated SQUARED distance to each EC centre restores a
+        genuine posterior over ECs, which is also what CLEAN itself predicts
+        from (infer_maxsep / infer_pvalue). Selection remains per-row
+        throughout: the strategies still return one score per pool instance.
+
+        This is exactly the Prototypical Networks formulation (Snell et al.
+        2017): p(y=k|x) = softmax(-d(f(x), c_k)) with c_k the class mean in
+        embedding space. Squared Euclidean is the principled choice rather than
+        plain L2 -- it is a Bregman divergence, for which the cluster mean is
+        the optimal representative, and CLEAN's centres are exactly cluster
+        means (get_cluster_center averages member embeddings).
+
+        Caveat worth measuring rather than assuming: Prototypical Networks are
+        TRAINED under this softmax, so their distance scale is calibrated for
+        it. CLEAN is trained with a triplet margin, so nothing guarantees the
+        scale suits a softmax over thousands of ECs. Margin-based acquisition
+        depends on the gap between the two nearest centres and is robust to
+        that scale; entropy and least-confidence are not. See
+        acquisition_temperature.
 
         Pass None to restore the original behaviour.
 
@@ -76,10 +99,13 @@ class DeterministicCLEANModel(DeterministicModel):
         if self.ec_centroids is None:
             return out
         centroids = self.ec_centroids.to(device=out.device, dtype=out.dtype)
+        t = max(float(self.acquisition_temperature), 1e-6)
         if out.dim() == 3:
             # bayesian/MC-dropout path: (n_samples, N, emb_dim)
-            return -torch.cdist(out, centroids.expand(out.shape[0], -1, -1))
-        return -torch.cdist(out, centroids)
+            d = torch.cdist(out, centroids.expand(out.shape[0], -1, -1))
+        else:
+            d = torch.cdist(out, centroids)
+        return -(d ** 2) / t
 
     # TODO(dhuseljic): Discuss
     @torch.inference_mode()
