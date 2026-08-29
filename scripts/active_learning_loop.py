@@ -10,6 +10,7 @@ from clean_app.src.CLEAN.utils import ensure_dirs, dump_info
 from train_loop import test_CLEAN_model, train_step_triplet, train_step_supconh, train_step_himulcone, validation_loop, save_end_of_training_metrics, reinit_CLEAN
 from plots import plot_pca_by_uncertainty, plot_pca_by_class
 from dataloader import reformat_emb, update_ec_id_dicts
+from clean_app.src.CLEAN.distance_map import get_cluster_center
 from utils import save_metrics
 
 def train_CLEAN_model_AL(model, criterion, optimizer, al_strat, train_datamodule, loss='triplet', eval_dataloader=None, test_data_list=[], num_epochs=100, batch_size=32, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', train_filename='train', eval_filename='eval', save_recomputed_embeddings=False, maxsep=True, emb_dir='/emb_data/', cache_dir='/distance_map/', knn=30, shuffle=True, _format_esm=True, temp=0.1, n_pos=9, clip_norm=False, model_name='CLEAN', metrics_save_path='training_metrics.json'):
@@ -221,6 +222,20 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
         if i_cycle != 0:
             if generate_plots:
                 seq_ids_before_query = [pool_datamodule.query_dataset.full_list[i] for i in pool_datamodule.unlabeled_indices] #need for plotting
+
+            # Refresh EC cluster centres from the CURRENT model before scoring,
+            # so acquisition sees a posterior over ECs rather than a softmax
+            # over embedding dimensions. No-op unless --acquisition_space
+            # distance was passed. Recomputed every round because the encoder
+            # is retrained each cycle and the centres move with it.
+            if getattr(model, 'ec_centroids', None) is not None or getattr(model, '_use_distance_logits', False):
+                model.set_ec_centroids(None)   # embed with the raw encoder
+                _train_emb = reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict).to(device)
+                with torch.no_grad():
+                    _proj = model.model(_train_emb)
+                _centers = get_cluster_center(_proj, train_datamodule.ec_id_dict)
+                model.set_ec_centroids(
+                    torch.stack([_centers[ec] for ec in train_datamodule.ec_id_dict]).to(device))
 
             indices, scores = al_strat.query(model=model, al_datamodule=pool_datamodule, acq_size=n_instances, return_utilities=True)
             scores = scores.cpu()

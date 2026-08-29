@@ -33,6 +33,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description='Train a functional prediction model with various choices')
+    parser.add_argument('--acquisition_space', type=str, default='embedding', choices=['embedding', 'distance'], help="What the acquisition functions score. 'embedding' (default) is the original behaviour: a softmax over the 128-d contrastive embedding, which is near-uniform for every sequence and gives a degenerate signal. 'distance' scores the negated distance to each EC cluster centre, a real posterior over ECs. Row selection is unchanged either way.")
+    parser.add_argument('--seed', type=int, default=1234, help='Random seed for numpy, torch, CLEAN and dal_toolbox. Was previously hardcoded to 1234, which made replicate runs impossible.')
     parser.add_argument('--mode', type=str, required=True, choices=['init', 'update', 'train', 'inference', 'simulation'], default='simulation', help='Stage of active learning. Init mode is for the initial points to run the experiment. Update mode is for after the experiment to query the next set of points. Train mode is simply to pre-train the model if using custom data (will not perform any active learning). Pre-training can also be done in init mode by specifying --perform_pretraining.')
     parser.add_argument('--active_type', type=str, choices=['uncertainty_sampling', 'entropy_sampling', 'margin_sampling', 'random_sampling', 'bayesian', 'BALD', 'BADGE', 'typiclust', 'QBC', 'bio-inspired'], required=True, help='Type of embedding to use')
     parser.add_argument('--train_csv_path', type=str, required=True, help='Path to the train CSV file')
@@ -80,6 +82,17 @@ if __name__ == "__main__":
     #----------------------------------------------------------------------------------#
     args = parser.parse_args()
 
+    # Re-seed from --seed. The module-level block above runs at import time,
+    # before argparse exists, so it can only ever apply the default; without
+    # this every run used seed 1234 and replicates were impossible.
+    RANDOM_STATE_SEED = args.seed
+    np.random.seed(RANDOM_STATE_SEED)
+    torch.manual_seed(RANDOM_STATE_SEED)
+    seed_everything(seed=RANDOM_STATE_SEED)
+    seed_everything2(seed=RANDOM_STATE_SEED)
+    print(f'[driver] RANDOM_STATE_SEED = {RANDOM_STATE_SEED}')
+    print(f'[driver] acquisition_space = {args.acquisition_space}')
+
     #set the embedding size hardcoded based on transformer training
     if args.embedding_type == 'esm2' or args.embedding_type == 'esm1b':
         input_size = 1280 #esm - change if loading smaller/larger checkpoint
@@ -122,6 +135,8 @@ if __name__ == "__main__":
     if args.mode != 'inference' and not args.perform_pretraining:
         model = DeterministicCLEANModel(model, loss_fn=criterion, optimizer=optimizer, bayesian=mc_dropout)
         learner = setup_CLEAN_active_learning_model(active_type=args.active_type)
+        if args.acquisition_space == 'distance':
+            model._use_distance_logits = True
 
     #not supported yet FIXME
     if not args.use_old_naming_convention:
@@ -361,6 +376,11 @@ if __name__ == "__main__":
 
     #execute simulation mode
     #-------------------------------------------------------------------------------------------#
+
+    # model may have been (re)wrapped by either of the two DeterministicCLEANModel
+    # construction sites above, so set the flag here where all paths converge.
+    if args.acquisition_space == 'distance':
+        model._use_distance_logits = True
 
     if args.mode == 'simulation': 
         if args.generate_plots:

@@ -43,6 +43,44 @@ class DeterministicCLEANModel(DeterministicModel):
 
         self.bayesian = bayesian
 
+        # When set, get_logits projects the contrastive embedding onto distances
+        # to these EC cluster centres, so downstream acquisition functions see a
+        # real class axis. See set_ec_centroids().
+        self.ec_centroids = None
+
+    def set_ec_centroids(self, centroids):
+        """Supply EC cluster centres so acquisition scores mean something.
+
+        CLEAN is contrastive and has no classification head, so its forward
+        output is a (N, emb_dim) embedding. dal_toolbox's uncertainty
+        strategies assume (N, n_classes) and softmax across the class axis;
+        given an embedding they softmax across embedding dimensions instead.
+        Because a LayerNorm keeps those coordinates near unit scale, the result
+        is within ~2% of maximum entropy for EVERY sequence, so the acquisition
+        signal is degenerate and the ranking is essentially noise.
+
+        Passing the negated distance to each EC centre restores a genuine
+        posterior over ECs, which is also what CLEAN itself predicts from
+        (infer_maxsep / infer_pvalue). Selection remains per-row throughout:
+        the strategies still return one score per pool instance.
+
+        Pass None to restore the original behaviour.
+
+        Args:
+            centroids: (n_ec, emb_dim) tensor of EC cluster centres, in the
+                order of the caller's ec_id_dict.
+        """
+        self.ec_centroids = centroids
+
+    def _project(self, out):
+        if self.ec_centroids is None:
+            return out
+        centroids = self.ec_centroids.to(device=out.device, dtype=out.dtype)
+        if out.dim() == 3:
+            # bayesian/MC-dropout path: (n_samples, N, emb_dim)
+            return -torch.cdist(out, centroids.expand(out.shape[0], -1, -1))
+        return -torch.cdist(out, centroids)
+
     # TODO(dhuseljic): Discuss
     @torch.inference_mode()
     def get_logits(self, *args, **kwargs):
@@ -52,9 +90,9 @@ class DeterministicCLEANModel(DeterministicModel):
             raise NotImplementedError('The `get_logits` method is not implemented.')
         
         if self.bayesian==True:
-            return self.model.get_logits_bayesian(*args, **kwargs)
+            return self._project(self.model.get_logits_bayesian(*args, **kwargs))
 
-        return self.model.get_logits(*args, **kwargs)
+        return self._project(self.model.get_logits(*args, **kwargs))
     
     def training_step(self, batch):
         anchor, pos, neg = batch
