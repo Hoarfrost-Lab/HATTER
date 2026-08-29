@@ -89,16 +89,40 @@ class QBC(Query):
         disagreement = self.calculate_disagreement(scores_list.detach().cpu().numpy(), logits.shape[0])
         return torch.from_numpy(disagreement).to(self.device)
 
-    #based on modAL package's KL-max-disagreement
     def calculate_disagreement(self, scores_list, X_shape):
-        p_consensus = np.mean(scores_list, axis=1)
-        learner_KL_div = np.zeros(shape=(X_shape, len(self.learners_list)))
+        """Committee disagreement per pool instance.
 
-        #for learner_idx, _ in enumerate(self.learners_list):
-        for i in range(X_shape):
-            learner_KL_div[i, :] = entropy(np.transpose(scores_list[:, i]), qk=np.transpose(p_consensus))
+        scores_list is (L, N): one utility per committee member per instance.
 
-        return np.max(learner_KL_div, axis=1)
+        The previous implementation had three defects, none of which raised:
+          1. `np.mean(scores_list, axis=1)` averaged each MEMBER across the
+             whole pool, giving an (L,) pool-level constant rather than the
+             (N,) per-instance consensus the cited modAL method needs. It also
+             made a score depend on pool composition, which drifts every AL
+             round.
+          2. `entropy(pk, qk)` on two length-L vectors returns a SCALAR, which
+             then broadcast across the whole `learner_KL_div[i, :]` row, so the
+             per-member axis carried no information and the final
+             `np.max(..., axis=1)` reduced over identical copies.
+          3. Members return utilities on incommensurable scales (measured:
+             LeastConfident 0-0.50, Entropy 0-0.69, Margin 0-1.00), and
+             `scipy.stats.entropy` renormalises them, so the result tracked
+             scale artefacts. Empirically this INVERTED the ordering: the
+             committee selected the most confident instances.
+
+        Fix: z-score each member across the pool to put them on a common scale,
+        then disagreement is the spread of member opinions on each instance.
+        Scale-invariant and genuinely per-instance. (Correcting only the axis
+        also restores the right ordering, but leaves the largest-range member
+        dominating the max.)
+        """
+        scores_list = np.asarray(scores_list, dtype=np.float64)
+
+        mu = scores_list.mean(axis=1, keepdims=True)
+        sd = scores_list.std(axis=1, keepdims=True) + 1e-12
+        z = (scores_list - mu) / sd
+
+        return z.std(axis=0)
 
 
 class BioInspiredSampling(Query):
@@ -185,16 +209,40 @@ class BioInspiredSampling(Query):
         disagreement = self.calculate_disagreement(scores_list.detach().cpu().numpy(), logits.shape[0])
         return torch.from_numpy(disagreement).to(self.device)
 
-    #based on modAL package's KL-max-disagreement
     def calculate_disagreement(self, scores_list, X_shape):
-        p_consensus = np.mean(scores_list, axis=1)
-        learner_KL_div = np.zeros(shape=(X_shape, len(self.learners_list)))
+        """Committee disagreement per pool instance.
 
-        #for learner_idx, _ in enumerate(self.learners_list):
-        for i in range(X_shape):
-            learner_KL_div[i, :] = entropy(np.transpose(scores_list[:, i]), qk=np.transpose(p_consensus))
+        scores_list is (L, N): one utility per committee member per instance.
 
-        return np.max(learner_KL_div, axis=1)
+        The previous implementation had three defects, none of which raised:
+          1. `np.mean(scores_list, axis=1)` averaged each MEMBER across the
+             whole pool, giving an (L,) pool-level constant rather than the
+             (N,) per-instance consensus the cited modAL method needs. It also
+             made a score depend on pool composition, which drifts every AL
+             round.
+          2. `entropy(pk, qk)` on two length-L vectors returns a SCALAR, which
+             then broadcast across the whole `learner_KL_div[i, :]` row, so the
+             per-member axis carried no information and the final
+             `np.max(..., axis=1)` reduced over identical copies.
+          3. Members return utilities on incommensurable scales (measured:
+             LeastConfident 0-0.50, Entropy 0-0.69, Margin 0-1.00), and
+             `scipy.stats.entropy` renormalises them, so the result tracked
+             scale artefacts. Empirically this INVERTED the ordering: the
+             committee selected the most confident instances.
+
+        Fix: z-score each member across the pool to put them on a common scale,
+        then disagreement is the spread of member opinions on each instance.
+        Scale-invariant and genuinely per-instance. (Correcting only the axis
+        also restores the right ordering, but leaves the largest-range member
+        dominating the max.)
+        """
+        scores_list = np.asarray(scores_list, dtype=np.float64)
+
+        mu = scores_list.mean(axis=1, keepdims=True)
+        sd = scores_list.std(axis=1, keepdims=True) + 1e-12
+        z = (scores_list - mu) / sd
+
+        return z.std(axis=0)
 
 class MyTypiClust(TypiClust):
     #adjusted parameters here
