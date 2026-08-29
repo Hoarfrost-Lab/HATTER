@@ -167,6 +167,9 @@ def train_CLEAN_model_AL(model, criterion, optimizer, al_strat, train_datamodule
     else:
         return model, None, (epoch_losses)
 
+_CENTROID_BATCH = 8192
+
+
 def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
     """EC cluster centres over everything currently LABELLED.
 
@@ -186,33 +189,77 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
     Only pool items in `labeled_indices` contribute. The rest of the pool has
     labels available (it is a simulation) but using them would be leakage.
     """
-    ec_to_raw = defaultdict(list)
-
-    for ec, ids in train_datamodule.ec_id_dict.items():
-        for s_id in ids:
-            ec_to_raw[ec].append(train_datamodule.emb[s_id])
-
+    # --- assemble the labelled set, reusing the cached stack where possible ----
+    #
+    # The raw ESM embeddings never change; only the projection does, because the
+    # encoder is retrained each round. So the expensive parts -- gathering
+    # thousands of per-sequence tensors, stacking them, and moving them to the
+    # GPU -- are done ONCE and cached on the model. Each later round appends
+    # only the newly acquired rows. This is what made the naive version slow
+    # enough to skip: it rebuilt a (n_labelled, 1280) tensor from a Python dict
+    # and re-copied it to the device on every acquisition.
+    cache = getattr(model, '_centroid_cache', None)
     full_list = pool_datamodule.query_dataset.full_list
-    for idx in pool_datamodule.labeled_indices:
-        s_id = full_list[idx]
-        ecs = pool_datamodule.id_ec.get(s_id, [])
-        if isinstance(ecs, str):
-            ecs = [ecs]
-        for ec in ecs:
-            ec_to_raw[ec].append(pool_datamodule.emb[s_id])
+    labelled = list(pool_datamodule.labeled_indices)
 
-    ecs = sorted(ec_to_raw.keys())
-    flat, bounds, cursor = [], [], 0
-    for ec in ecs:
-        flat.extend(ec_to_raw[ec])
-        bounds.append((cursor, cursor + len(ec_to_raw[ec])))
-        cursor += len(ec_to_raw[ec])
+    def _ecs_for(s_id, datamodule):
+        ecs = datamodule.id_ec.get(s_id, [])
+        return [ecs] if isinstance(ecs, str) else list(ecs)
 
+    if cache is None:
+        rows, row_ecs = [], []
+        for ec, ids in train_datamodule.ec_id_dict.items():
+            for s_id in ids:
+                rows.append(train_datamodule.emb[s_id])
+                row_ecs.append(ec)
+        seen_pool = set()
+        for idx in labelled:
+            s_id = full_list[idx]
+            for ec in _ecs_for(s_id, pool_datamodule):
+                rows.append(pool_datamodule.emb[s_id])
+                row_ecs.append(ec)
+            seen_pool.add(idx)
+        cache = {'raw': torch.stack(rows, dim=0).to(device),
+                 'row_ecs': row_ecs,
+                 'seen_pool': seen_pool}
+        model._centroid_cache = cache
+    else:
+        new_rows, new_ecs = [], []
+        for idx in labelled:
+            if idx in cache['seen_pool']:
+                continue
+            s_id = full_list[idx]
+            for ec in _ecs_for(s_id, pool_datamodule):
+                new_rows.append(pool_datamodule.emb[s_id])
+                new_ecs.append(ec)
+            cache['seen_pool'].add(idx)
+        if new_rows:
+            cache['raw'] = torch.cat(
+                [cache['raw'], torch.stack(new_rows, dim=0).to(device)], dim=0)
+            cache['row_ecs'].extend(new_ecs)
+
+    # --- project once, then mean-pool per EC with a scatter -------------------
+    #
+    # Batched so a large labelled set cannot OOM, and the per-EC mean is a
+    # single index_add rather than a Python loop over ECs.
+    raw, row_ecs = cache['raw'], cache['row_ecs']
+    ecs = sorted(set(row_ecs))
+    ec_pos = {ec: i for i, ec in enumerate(ecs)}
+    idx_t = torch.tensor([ec_pos[e] for e in row_ecs], device=device, dtype=torch.long)
+
+    chunks = []
     with torch.no_grad():
-        projected = model.model(torch.stack(flat, dim=0).to(device))
+        for start in range(0, raw.shape[0], _CENTROID_BATCH):
+            chunks.append(model.model(raw[start:start + _CENTROID_BATCH]))
+    projected = torch.cat(chunks, dim=0) if len(chunks) > 1 else chunks[0]
 
-    centres = torch.stack([projected[a:b].mean(dim=0) for a, b in bounds], dim=0)
-    return centres.to(device)
+    sums = torch.zeros(len(ecs), projected.shape[1],
+                       device=device, dtype=projected.dtype)
+    sums.index_add_(0, idx_t, projected)
+    counts = torch.zeros(len(ecs), device=device, dtype=projected.dtype)
+    counts.index_add_(0, idx_t, torch.ones_like(idx_t, dtype=projected.dtype))
+
+    return sums / counts.unsqueeze(1).clamp_min(1)
 
 def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[]):
 
