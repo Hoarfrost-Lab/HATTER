@@ -9,6 +9,7 @@ from clean_app.src.CLEAN.utils import ensure_dirs, dump_info
 
 from train_loop import test_CLEAN_model, train_step_triplet, train_step_supconh, train_step_himulcone, validation_loop, save_end_of_training_metrics, reinit_CLEAN
 from plots import plot_pca_by_uncertainty, plot_pca_by_class
+from collections import defaultdict
 from dataloader import reformat_emb, update_ec_id_dicts
 from clean_app.src.CLEAN.distance_map import get_cluster_center
 from utils import save_metrics
@@ -166,6 +167,53 @@ def train_CLEAN_model_AL(model, criterion, optimizer, al_strat, train_datamodule
     else:
         return model, None, (epoch_losses)
 
+def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
+    """EC cluster centres over everything currently LABELLED.
+
+    CLEAN predicts an EC by finding the nearest EC cluster centre, where a
+    centre is the mean projected embedding of the labelled sequences carrying
+    that EC. In a simulation the labelled set grows every round, so the centres
+    must be rebuilt from train PLUS whatever has been acquired so far --
+    otherwise a rare EC that started with two examples keeps a centre computed
+    from those two even after AL has labelled five more of it, which is exactly
+    the regime the rare-EC analysis cares about.
+
+    Acquired ECs that were absent from the initial train set get a centre here
+    once they are labelled, matching the real workflow: labelling a novel EC is
+    what makes it predictable. The number of EC columns therefore grows across
+    rounds. That is fine for acquisition, which scores per row.
+
+    Only pool items in `labeled_indices` contribute. The rest of the pool has
+    labels available (it is a simulation) but using them would be leakage.
+    """
+    ec_to_raw = defaultdict(list)
+
+    for ec, ids in train_datamodule.ec_id_dict.items():
+        for s_id in ids:
+            ec_to_raw[ec].append(train_datamodule.emb[s_id])
+
+    full_list = pool_datamodule.query_dataset.full_list
+    for idx in pool_datamodule.labeled_indices:
+        s_id = full_list[idx]
+        ecs = pool_datamodule.id_ec.get(s_id, [])
+        if isinstance(ecs, str):
+            ecs = [ecs]
+        for ec in ecs:
+            ec_to_raw[ec].append(pool_datamodule.emb[s_id])
+
+    ecs = sorted(ec_to_raw.keys())
+    flat, bounds, cursor = [], [], 0
+    for ec in ecs:
+        flat.extend(ec_to_raw[ec])
+        bounds.append((cursor, cursor + len(ec_to_raw[ec])))
+        cursor += len(ec_to_raw[ec])
+
+    with torch.no_grad():
+        projected = model.model(torch.stack(flat, dim=0).to(device))
+
+    centres = torch.stack([projected[a:b].mean(dim=0) for a, b in bounds], dim=0)
+    return centres.to(device)
+
 def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[]):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -228,14 +276,10 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
             # over embedding dimensions. No-op unless --acquisition_space
             # distance was passed. Recomputed every round because the encoder
             # is retrained each cycle and the centres move with it.
-            if getattr(model, 'ec_centroids', None) is not None or getattr(model, '_use_distance_logits', False):
+            if getattr(model, '_use_distance_logits', False):
                 model.set_ec_centroids(None)   # embed with the raw encoder
-                _train_emb = reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict).to(device)
-                with torch.no_grad():
-                    _proj = model.model(_train_emb)
-                _centers = get_cluster_center(_proj, train_datamodule.ec_id_dict)
                 model.set_ec_centroids(
-                    torch.stack([_centers[ec] for ec in train_datamodule.ec_id_dict]).to(device))
+                    build_ec_centroids(model, train_datamodule, pool_datamodule, device))
 
             indices, scores = al_strat.query(model=model, al_datamodule=pool_datamodule, acq_size=n_instances, return_utilities=True)
             scores = scores.cpu()
