@@ -170,6 +170,42 @@ def train_CLEAN_model_AL(model, criterion, optimizer, al_strat, train_datamodule
 _CENTROID_BATCH = 8192
 
 
+def update_dataloader(pool_datamodule, train_datamodule, regime, newly_acquired):
+    """Dataloader for one round's update, per --update_regime.
+
+    Mirrors dal_toolbox's train_dataloader (Subset + RandomSampler + collator)
+    so batching and sampling stay identical across regimes; only the anchor set
+    differs.
+
+      scratch        cumulative acquired pool -- the published HATTER setup,
+                     where the pool IS the training data and the model is built
+                     from nothing.
+      ft_new         ONLY the sequences acquired this round. Fine-tuning a
+                     pretrained model on new labels alone, with no rehearsal of
+                     anything previously seen.
+      ft_integrated  the original train partition PLUS everything acquired.
+                     Rehearsal, a standard domain-adaptation remedy for the
+                     forgetting that ft_new invites.
+
+    ft_new vs ft_integrated is the comparison the paper turns on.
+    """
+    from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Subset
+
+    dm = pool_datamodule
+    if regime == 'ft_new':
+        if not newly_acquired:
+            return []
+        dataset = Subset(dm.train_dataset, indices=list(newly_acquired))
+    elif regime == 'ft_integrated':
+        acquired = Subset(dm.train_dataset, indices=list(dm.labeled_indices))
+        dataset = ConcatDataset([train_datamodule.train_dataset, acquired])
+    else:
+        return dm.train_dataloader()
+
+    sampler = RandomSampler(dataset, num_samples=None)
+    return DataLoader(dataset, batch_size=dm.train_batch_size,
+                      sampler=sampler, collate_fn=dm.collator)
+
 def apply_labeled_scope(pool_datamodule, train_datamodule):
     """Restrict the pool dataset's contrastive mining to train + acquired.
 
@@ -279,7 +315,7 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
 
     return sums / counts.unsqueeze(1).clamp_min(1)
 
-def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[]):
+def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch'):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
@@ -323,6 +359,7 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
     pool_datamodule.random_init(n_samples=n_instances)
     indices = pool_datamodule.labeled_indices
     apply_labeled_scope(pool_datamodule, train_datamodule)
+    newly_acquired = list(pool_datamodule.labeled_indices)
 
     break_early = False
     exit_round = False
@@ -348,6 +385,7 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
                     build_ec_centroids(model, train_datamodule, pool_datamodule, device))
 
             indices, scores = al_strat.query(model=model, al_datamodule=pool_datamodule, acq_size=n_instances, return_utilities=True)
+            newly_acquired = list(indices)
             scores = scores.cpu()
 
             print(indices)
@@ -368,7 +406,7 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
 
         #train one epoch
         #____________________________________________________________________#
-        for i, item in enumerate(pool_datamodule.train_dataloader()):
+        for i, item in enumerate(update_dataloader(pool_datamodule, train_datamodule, update_regime, newly_acquired)):
             batch_loss = train_step(item, device, optimizer, model, criterion, clip_norm=clip_norm, temp=temp, n_pos=n_pos)
             epoch_loss += batch_loss
 
@@ -687,7 +725,7 @@ def train_standard_model_AL(model, criterion, optimizer, al_strat, train_datamod
     else:
         return model, None, (epoch_losses)
 
-def run_standard_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, plot_tuple=None, model_name='standard', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, _format_esm=False, test_data_list=[]):
+def run_standard_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, plot_tuple=None, model_name='standard', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, _format_esm=False, test_data_list=[], update_regime='scratch'):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
