@@ -170,6 +170,66 @@ def train_CLEAN_model_AL(model, criterion, optimizer, al_strat, train_datamodule
 _CENTROID_BATCH = 8192
 
 
+def build_reference_set(train_datamodule, pool_datamodule, train_data_path,
+                        train_filename, round_dir):
+    """Reference set = train PLUS everything acquired so far.
+
+    CLEAN predicts by nearest EC centroid, and those centroids are built from a
+    reference set. By default that set is the train partition alone: the
+    centroids MOVE every round (they are recomputed through the updated
+    encoder), but their MEMBERSHIP never changes -- an acquired sequence never
+    joins the set it is being predicted against.
+
+    That is not what deployment looks like. Validating a sequence experimentally
+    means adding it to your reference database, which gives a centroid nearer
+    the shifted region immediately, with no encoder update at all.
+
+    infer_maxsep rebuilds its own ec_id_dict by reading the reference CSV off
+    disk, and get_cluster_center slices the embedding tensor in that dict's
+    order -- so the CSV and the embedding tensor have to agree. The cleanest way
+    to extend the set is therefore to write a combined CSV for the round and
+    hand back a matching tensor.
+
+    Returns (path, name, emb_tensor) to pass through to test_CLEAN_model.
+    """
+    full_list = pool_datamodule.query_dataset.full_list
+    labeled = [full_list[i] for i in pool_datamodule.labeled_indices]
+
+    src = os.path.join(train_data_path, train_filename + '.csv')
+    rows, seen = [], set()
+    with open(src) as fh:
+        header = fh.readline()
+        for line in fh:
+            parts = line.rstrip('\n').split('\t')
+            if parts and parts[0]:
+                rows.append(parts[:3])
+                seen.add(parts[0])
+
+    emb_map = dict(train_datamodule.emb)
+    for _id in labeled:
+        if _id in seen:
+            continue
+        ecs = pool_datamodule.id_ec.get(_id)
+        if not ecs:
+            continue
+        ec = ecs[0] if isinstance(ecs, (list, tuple)) else ecs
+        if _id not in pool_datamodule.emb:
+            continue
+        rows.append([_id, ec, ''])
+        emb_map[_id] = pool_datamodule.emb[_id]
+        seen.add(_id)
+
+    name = 'reference'
+    out_csv = os.path.join(round_dir, name + '.csv')
+    with open(out_csv, 'w') as fh:
+        fh.write(header if header.strip() else 'Entry\tEC number\tSequence\n')
+        for r in rows:
+            fh.write('\t'.join((r + ['', '', ''])[:3]) + '\n')
+
+    # Rebuild the dict exactly as infer_maxsep will, so the tensor order matches.
+    _, ec_id_dict = get_ec_id_dict(out_csv)
+    return round_dir, name, reformat_emb(emb_map, ec_id_dict)
+
 def update_dataloader(pool_datamodule, train_datamodule, regime, newly_acquired):
     """Dataloader for one round's update, per --update_regime.
 
@@ -315,7 +375,7 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
 
     return sums / counts.unsqueeze(1).clamp_min(1)
 
-def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch'):
+def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train'):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
@@ -551,15 +611,22 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
         #            train_file=pool_filename)
 
         for (test_data_name, test_data_path, test_data) in test_data_list:
+            _ref_path, _ref_name = train_data_path, train_filename
+            _ref_emb = reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict)
+            if reference_set == 'train_plus_acquired':
+                _ref_path, _ref_name, _ref_emb = build_reference_set(
+                    train_datamodule, pool_datamodule, train_data_path,
+                    train_filename, save_path + '/round_{}'.format(i_cycle))
+
             test_CLEAN_model(model=model, 
-                         train_data_path=train_data_path, 
+                         train_data_path=_ref_path, 
                          test_data_path=test_data_path, 
                          device=device, 
-                         train_name=train_filename, 
+                         train_name=_ref_name, 
                          test_name=test_data_name, 
                          checkpoint_dir=save_path+'/round_{}'.format(i_cycle), 
                          metrics_save_path=test_data_name+'_metrics.json',
-                         train_emb=reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict),
+                         train_emb=_ref_emb,
                          emb_out_dir=emb_dir,
                          _format_esm=_format_esm,
                          maxsep=maxsep,
@@ -725,7 +792,7 @@ def train_standard_model_AL(model, criterion, optimizer, al_strat, train_datamod
     else:
         return model, None, (epoch_losses)
 
-def run_standard_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, plot_tuple=None, model_name='standard', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, _format_esm=False, test_data_list=[], update_regime='scratch'):
+def run_standard_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, plot_tuple=None, model_name='standard', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train'):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)

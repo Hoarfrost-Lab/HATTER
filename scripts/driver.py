@@ -36,6 +36,7 @@ if __name__ == "__main__":
     parser.add_argument('--acquisition_space', type=str, default='embedding', choices=['embedding', 'distance'], help="What the acquisition functions score. 'embedding' (default) is the original behaviour: a softmax over the 128-d contrastive embedding, which is near-uniform for every sequence and gives a degenerate signal. 'distance' scores the negated distance to each EC cluster centre, a real posterior over ECs. Row selection is unchanged either way.")
     parser.add_argument('--no_format_esm', dest='format_esm', action='store_false', help="Treat cached .pt embeddings as bare tensors rather than ESM extract.py's dict output. Default is to unwrap via format_esm(), which is correct for anything produced by esm/scripts/extract.py. Previously this was wired to --use_old_naming_convention, an unrelated flag controlling cache filenames.")
     parser.set_defaults(format_esm=True)
+    parser.add_argument('--reference_set', type=str, default='train', choices=['train', 'train_plus_acquired'], help="Which sequences build the EC centroids that predictions are made against. 'train' (default) uses the train partition only: centroids still move each round because they are recomputed through the updated encoder, but an acquired sequence never joins the set it is predicted against. 'train_plus_acquired' adds acquired sequences to the reference database each round, which is what a deployed human-in-the-loop system would do.")
     parser.add_argument('--update_regime', type=str, default='scratch', choices=['scratch', 'ft_new', 'ft_integrated'], help="What each round trains on. 'scratch': the cumulative acquired pool, the published HATTER setup where the pool IS the training data. 'ft_new': only the sequences acquired this round, i.e. fine-tuning a pretrained model on new labels with no rehearsal. 'ft_integrated': the original train partition plus everything acquired, i.e. rehearsal. ft_new and ft_integrated expect --model_load_path.")
     parser.add_argument('--mining_scope', type=str, default='labeled', choices=['labeled', 'pool'], help="Where contrastive positives and negatives are drawn from during simulation. 'labeled' (default) uses train plus already-acquired pool points only; an EC with a single labelled member self-mutates until a second arrives. 'pool' restores the original behaviour, which mined from the whole pool and thereby used EC labels of unacquired data.")
     parser.add_argument('--acquisition_temperature', type=float, default=1.0, help='Softmax temperature on the negated squared EC-centroid distances. Only used with --acquisition_space distance. CLEAN is trained with a triplet margin rather than a prototypical softmax, so its distance scale is not calibrated for one; T<1 sharpens a posterior that comes out too flat.')
@@ -98,6 +99,7 @@ if __name__ == "__main__":
     print(f'[driver] RANDOM_STATE_SEED = {RANDOM_STATE_SEED}')
     print(f'[driver] acquisition_space = {args.acquisition_space}')
     print(f'[driver] update_regime = {args.update_regime}')
+    print(f'[driver] reference_set = {args.reference_set}')
     if args.update_regime in ('ft_new', 'ft_integrated') and not args.model_load_path:
         raise SystemExit(f'--update_regime {args.update_regime} fine-tunes a pretrained model; pass --model_load_path')
 
@@ -419,6 +421,7 @@ if __name__ == "__main__":
                                    eval_dataloader=eval_dataloader, 
                                    test_data_list=test_data_list,
                                         update_regime=args.update_regime,
+                                        reference_set=args.reference_set,
                                    n_instances=args.num_instances, 
                                    n_queries=args.num_queries, 
                                    generate_plots=args.generate_plots, 
