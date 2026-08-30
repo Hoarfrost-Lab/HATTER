@@ -141,13 +141,64 @@ def ensure_dirs(path):
         os.makedirs(path)
         
 def retrieve_esm1b_embedding(name, path='./', emb_out_dir='/emb_data/'):
+    """Embed a fasta with ESM1b, skipping sequences already on disk.
+
+    Two problems with the original, both costly in an AL loop:
+
+    1. No skip. Every call re-embedded the ENTIRE fasta even when the .pt files
+       already existed. Re-embedding a 144k-sequence train partition costs ~100
+       GPU-minutes, and it happened once per run. Worse, parallel runs sharing
+       an emb_out_dir would race to write the same files.
+
+    2. `subprocess.run` without checking the return code. When
+       esm/scripts/extract.py is absent the failure is printed and then ignored;
+       execution continues and dies much later in load_emb with a
+       FileNotFoundError on some .pt, pointing at a missing embedding rather
+       than the missing extractor.
+
+    Embeddings are keyed by sequence id, so skipping is safe: an id's embedding
+    depends only on its sequence.
+    """
     esm_script = "esm/scripts/extract.py"
     esm_type = "esm1b_t33_650M_UR50S"
     esm_out = path+'/'+emb_out_dir
     fasta_name = path+"/" + name + ".fasta"
-    command = ["python", esm_script, esm_type, 
+
+    # Which ids in this fasta still need embedding?
+    ensure_dirs(esm_out)
+    records, current = [], None
+    with open(fasta_name) as fh:
+        for line in fh:
+            if line.startswith('>'):
+                current = [line, []]
+                records.append(current)
+            elif current is not None:
+                current[1].append(line)
+
+    todo = [(hdr, body) for hdr, body in records
+            if not os.path.exists(os.path.join(esm_out, hdr[1:].strip().split()[0] + '.pt'))]
+
+    if not todo:
+        print(f"  all {len(records)} embeddings already present for {name}, skipping ESM")
+        return
+
+    if len(todo) < len(records):
+        # Only feed the extractor what is missing.
+        fasta_name = path + "/" + name + "_missing.fasta"
+        with open(fasta_name, 'w') as fh:
+            for hdr, body in todo:
+                fh.write(hdr)
+                fh.writelines(body)
+        print(f"  {len(todo)}/{len(records)} embeddings missing for {name}, embedding those only")
+
+    command = ["python", esm_script, esm_type,
               fasta_name, esm_out, "--include", "mean"]
-    subprocess.run(command)
+    result = subprocess.run(command)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ESM extraction failed (exit {result.returncode}) for {fasta_name}. "
+            f"Is {esm_script} present? It must be cloned INSIDE the scripts/ "
+            f"directory, not outside as the README says.")
  
 def compute_emb_distance(train_file, path='./', emb_out_dir='/emb_data/', cache_dir=None, ec_id_dict=None, device='cpu', dtype=torch.float32, _format_esm=True, use_old_naming_convention=False, dont_save=False):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
