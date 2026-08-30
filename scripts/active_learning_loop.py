@@ -6,13 +6,14 @@ import warnings
 from tqdm import tqdm
 
 from clean_app.src.CLEAN.infer import infer_maxsep, infer_pvalue
-from clean_app.src.CLEAN.utils import ensure_dirs, dump_info
+from clean_app.src.CLEAN.utils import ensure_dirs, dump_info, get_ec_id_dict
 
 from train_loop import test_CLEAN_model, train_step_triplet, train_step_supconh, train_step_himulcone, validation_loop, save_end_of_training_metrics, reinit_CLEAN
 from plots import plot_pca_by_uncertainty, plot_pca_by_class
 from collections import defaultdict
 from dataloader import reformat_emb, update_ec_id_dicts
 from clean_app.src.CLEAN.distance_map import get_cluster_center
+from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Subset
 from utils import save_metrics
 
 def train_CLEAN_model_AL(model, criterion, optimizer, al_strat, train_datamodule, loss='triplet', eval_dataloader=None, test_data_list=[], num_epochs=100, batch_size=32, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', train_filename='train', eval_filename='eval', save_recomputed_embeddings=False, maxsep=True, emb_dir='/emb_data/', cache_dir='/distance_map/', knn=30, shuffle=True, _format_esm=True, temp=0.1, n_pos=9, clip_norm=False, model_name='CLEAN', metrics_save_path='training_metrics.json'):
@@ -317,8 +318,6 @@ def update_dataloader(pool_datamodule, train_datamodule, regime, newly_acquired,
 
     ft_new vs ft_integrated is the comparison the paper turns on.
     """
-    from torch.utils.data import ConcatDataset, DataLoader, RandomSampler, Subset
-
     dm = pool_datamodule
     if regime == 'ft_new':
         if not newly_acquired:
