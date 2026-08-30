@@ -1,6 +1,7 @@
 import numpy as np
 import torch
 import os
+import random
 import warnings
 from tqdm import tqdm
 
@@ -230,7 +231,74 @@ def build_reference_set(train_datamodule, pool_datamodule, train_data_path,
     _, ec_id_dict = get_ec_id_dict(out_csv)
     return round_dir, name, reformat_emb(emb_map, ec_id_dict)
 
-def update_dataloader(pool_datamodule, train_datamodule, regime, newly_acquired):
+def _replay_subset(train_datamodule, n_acquired, ratio, selection, seed):
+    """Choose which training sequences to replay alongside the new ones.
+
+    ratio is replayed-per-new. ratio=1.0 gives a 50:50 new:replay mix, 3.0 gives
+    25:75, 0.33 gives 75:25. ratio=None replays the ENTIRE train partition,
+    which is the original ft_integrated behaviour -- and at 144,364 train
+    against a few hundred acquired that is roughly 451:1, so the new data is
+    ~0.2% of each epoch and is effectively drowned out. The continual-learning
+    literature works in the 50:50 to 25:75 band.
+
+    selection:
+      uniform_ec  spread the replay budget evenly over training ECs, so rare and
+                  abundant functions are rehearsed alike. The natural default
+                  here: uncertainty sampling already over-draws abundant ECs by
+                  ~2.5-3.5x, so replaying proportionally would compound that
+                  skew rather than counter it.
+      random      uniform over sequences, i.e. proportional to EC abundance.
+                  What the CL literature usually means by a replay buffer.
+    """
+    full = train_datamodule.train_dataset
+    n_train = len(full)
+    if ratio is None:
+        return full
+
+    n_replay = min(n_train, max(1, int(round(ratio * max(1, n_acquired)))))
+    rng = random.Random(seed)
+
+    if selection == 'random':
+        idx = rng.sample(range(n_train), n_replay)
+        return Subset(full, idx)
+
+    # uniform_ec: round-robin over ECs, taking one member at a time, so the
+    # budget spreads across as many distinct functions as it can reach.
+    ec_id_dict = getattr(train_datamodule, 'ec_id_dict', None)
+    if not ec_id_dict:
+        idx = rng.sample(range(n_train), n_replay)
+        return Subset(full, idx)
+
+    order = getattr(train_datamodule.train_dataset, 'full_list', None)
+    pos = {}
+    if order is not None:
+        # full_list holds ECs; positions must come from the dataset's own order
+        cursor = 0
+        for ec in ec_id_dict:
+            for _id in ec_id_dict[ec]:
+                pos.setdefault(ec, []).append(cursor)
+                cursor += 1
+    if not pos:
+        idx = rng.sample(range(n_train), n_replay)
+        return Subset(full, idx)
+
+    ecs = list(pos.keys())
+    rng.shuffle(ecs)
+    for ec in ecs:
+        rng.shuffle(pos[ec])
+    picked, ring = [], 0
+    while len(picked) < n_replay and ecs:
+        ec = ecs[ring % len(ecs)]
+        if pos[ec]:
+            picked.append(pos[ec].pop())
+        else:
+            ecs.remove(ec)
+            continue
+        ring += 1
+    return Subset(full, picked[:n_replay])
+
+def update_dataloader(pool_datamodule, train_datamodule, regime, newly_acquired,
+                      replay_ratio=None, replay_selection='uniform_ec', seed=1234):
     """Dataloader for one round's update, per --update_regime.
 
     Mirrors dal_toolbox's train_dataloader (Subset + RandomSampler + collator)
@@ -258,7 +326,9 @@ def update_dataloader(pool_datamodule, train_datamodule, regime, newly_acquired)
         dataset = Subset(dm.train_dataset, indices=list(newly_acquired))
     elif regime == 'ft_integrated':
         acquired = Subset(dm.train_dataset, indices=list(dm.labeled_indices))
-        dataset = ConcatDataset([train_datamodule.train_dataset, acquired])
+        replay = _replay_subset(train_datamodule, len(acquired), replay_ratio,
+                                replay_selection, seed)
+        dataset = ConcatDataset([replay, acquired])
     else:
         return dm.train_dataloader()
 
@@ -375,7 +445,10 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
 
     return sums / counts.unsqueeze(1).clamp_min(1)
 
-def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train'):
+RANDOM_SEED_FALLBACK = 1234
+
+
+def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec'):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
@@ -466,7 +539,8 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
 
         #train one epoch
         #____________________________________________________________________#
-        for i, item in enumerate(update_dataloader(pool_datamodule, train_datamodule, update_regime, newly_acquired)):
+        for i, item in enumerate(update_dataloader(pool_datamodule, train_datamodule, update_regime, newly_acquired,
+                                                  replay_ratio, replay_selection, RANDOM_SEED_FALLBACK)):
             batch_loss = train_step(item, device, optimizer, model, criterion, clip_norm=clip_norm, temp=temp, n_pos=n_pos)
             epoch_loss += batch_loss
 
@@ -792,7 +866,7 @@ def train_standard_model_AL(model, criterion, optimizer, al_strat, train_datamod
     else:
         return model, None, (epoch_losses)
 
-def run_standard_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, plot_tuple=None, model_name='standard', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train'):
+def run_standard_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, plot_tuple=None, model_name='standard', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec'):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
