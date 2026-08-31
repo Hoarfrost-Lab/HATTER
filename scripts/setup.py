@@ -153,6 +153,22 @@ class DeterministicCLEANModel(DeterministicModel):
 
         return anchor_out, pos_out, neg_out
 
+def _strip_wrapper_prefix(state):
+    """Accept checkpoints saved from the DeterministicCLEANModel wrapper.
+
+    HATTER's own `--mode train` saves from the wrapper, whose parameters live
+    under `self.model`, so every key carries a "model." prefix. get_CLEAN_NN
+    loads into a bare CLEANLayerNormNet, so a checkpoint this codebase produced
+    cannot be read back through --model_load_path without stripping it. CLEAN's
+    released weights have bare keys, which is why the mismatch only shows up on
+    checkpoints generated here.
+    """
+    state = state.get('state_dict', state) if isinstance(state, dict) else state
+    if isinstance(state, dict) and any(k.startswith('model.') for k in state):
+        state = {(k[len('model.'):] if k.startswith('model.') else k): v
+                 for k, v in state.items()}
+    return state
+
 def get_CLEAN_NN(model_name='layernorm', dropout_rate=0.001, input_size=1280, hidden_size=512, output_embedding_size=128, learning_rate=0.01, momentum=0.98, pretrained_weights=None, device='cpu', dtype=torch.float32, mc_dropout=False):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -188,7 +204,7 @@ def get_CLEAN_NN(model_name='layernorm', dropout_rate=0.001, input_size=1280, hi
             model = CLEANInstanceNormNet(input_dim=input_size, hidden_dim=hidden_size, out_dim=output_embedding_size, device=device, dtype=dtype, drop_out=dropout_rate)
 
     if pretrained_weights is not None:
-        model.load_state_dict(torch.load(pretrained_weights))
+        model.load_state_dict(_strip_wrapper_prefix(torch.load(pretrained_weights, map_location='cpu')))
 
     return model
 
@@ -371,6 +387,6 @@ def get_standard_NN(dropout_rate=0.001, input_size=1280, hidden_size=512, output
         model = TwoLayerClassifier(in_dimension=input_size, feature_dim=hidden_size, num_classes=output_embedding_size, dropout_rate=dropout_rate)
 
     if pretrained_weights is not None:
-        model.load_state_dict(torch.load(pretrained_weights))
+        model.load_state_dict(_strip_wrapper_prefix(torch.load(pretrained_weights, map_location='cpu')))
 
     return model
