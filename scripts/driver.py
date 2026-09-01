@@ -70,6 +70,7 @@ if __name__ == "__main__":
     parser.add_argument('--plot_name', type=str, default='CLEAN', help='To be used in the titles of plots.')
     parser.add_argument('--convert_from_nucleotides', action='store_true', help='Convert sequence column to amino acids if necessary for selected model')
     parser.add_argument('--generate_plots', action='store_true', help='Specifies if plots should be generated after each query iteration')
+    parser.add_argument('--eval_every', type=int, default=1, help="Evaluate on the test sets every Nth round instead of every round. Default 1 preserves the existing behaviour exactly. Per-round evaluation infers 60,135 test sequences and rebuilds the reference set, which is ~95%% of a round's wall time, so a full-pool sweep at batch 384 costs 25h at N=1 and about 3h at N=10 while still yielding 44 points on the curve. The final round is ALWAYS evaluated regardless of N, so the endpoint is never lost.")
     parser.add_argument('--checkpoint_and_eval', action='store_true', help='Whether to save intermediary checkpoints based on evaluation dataset performance')
     parser.add_argument('--precomputed', action='store_true', help='CLEAN ONLY! If the ESM embeddings and distance maps (train) were precomputed for ALL data.')
     parser.add_argument('--use_old_naming_convention', action='store_true', help='CLEAN ONLY! Use CLEAN naming convention for precomputed embeddings and distmaps.')
@@ -423,6 +424,7 @@ if __name__ == "__main__":
                                    loss=args.loss,
                                    eval_dataloader=eval_dataloader, 
                                    test_data_list=test_data_list,
+                                        eval_every=args.eval_every,
                                         update_regime=args.update_regime,
                                         reference_set=args.reference_set,
                                         replay_ratio=args.replay_ratio,

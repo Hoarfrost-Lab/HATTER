@@ -447,7 +447,7 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
 RANDOM_SEED_FALLBACK = 1234
 
 
-def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec'):
+def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec', eval_every=1):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
@@ -683,7 +683,12 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
         #            extra_folder='/round_{}/{}/recomputed/'.format(cache_dir, i_cycle), 
         #            train_file=pool_filename)
 
-        for (test_data_name, test_data_path, test_data) in test_data_list:
+        # Evaluation dominates round cost: it infers every test sequence and,
+        # under train_plus_acquired, rebuilds the reference set too. Skipping it
+        # on most rounds is what makes a full-pool sweep affordable. The LAST
+        # round always evaluates, so the endpoint is never lost to the stride.
+        _do_eval = (eval_every <= 1) or (i_cycle % eval_every == 0) or (i_cycle == n_queries)
+        for (test_data_name, test_data_path, test_data) in (test_data_list if _do_eval else []):
             _ref_path, _ref_name = train_data_path, train_filename
             _ref_emb = reformat_emb(train_datamodule.emb, train_datamodule.ec_id_dict)
             if reference_set == 'train_plus_acquired':
