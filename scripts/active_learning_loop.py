@@ -6,7 +6,8 @@ import warnings
 from tqdm import tqdm
 
 from clean_app.src.CLEAN.infer import infer_maxsep, infer_pvalue
-from clean_app.src.CLEAN.utils import ensure_dirs, dump_info, get_ec_id_dict
+from clean_app.src.CLEAN.utils import (ensure_dirs, dump_info, get_ec_id_dict,
+                                       mutate_incorrect_seq_ECs, retrieve_esm1b_embedding)
 
 from train_loop import test_CLEAN_model, train_step_triplet, train_step_supconh, train_step_himulcone, validation_loop, save_end_of_training_metrics, reinit_CLEAN
 from plots import plot_pca_by_uncertainty, plot_pca_by_class
@@ -298,6 +299,67 @@ def _replay_subset(train_datamodule, n_acquired, ratio, selection, seed):
         ring += 1
     return Subset(full, picked[:n_replay])
 
+
+def target_candidates(model, pool_datamodule, target_ec, device):
+    """Pool indices the model currently PREDICTS to be the target EC.
+
+    This is what makes the target experiment match its use case. A scientist
+    hunting one function does not send the globally most uncertain sequences to
+    the bench; they send sequences their model thinks ARE the target, and the
+    assay returns yes or no. Acquisition then ranks within that shortlist rather
+    than over the whole pool.
+
+    Prediction is argmax over the same negated squared distances to EC centroids
+    that the acquisition functions score, so filter and ranking agree by
+    construction.
+
+    Returns (candidate_indices, n_predicted). An empty list is meaningful, not an
+    error: it says the model currently believes the target is nowhere in the
+    pool, which is the failure mode this experiment exists to detect.
+    """
+    ec_order = getattr(model, '_ec_order', None) or []
+    if target_ec not in ec_order:
+        # No centroid for the target yet -- nothing can be predicted as it.
+        return [], 0
+    col = ec_order.index(target_ec)
+    unl = list(pool_datamodule.unlabeled_indices)
+    if not unl:
+        return [], 0
+    loader = DataLoader(pool_datamodule.query_dataset, batch_size=4096,
+                        sampler=unl, collate_fn=pool_datamodule.collator)
+    preds = []
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            x = batch[0] if isinstance(batch, (list, tuple)) else batch
+            logits = model(x.to(device))
+            preds.append(logits.argmax(1).cpu())
+    model.train()
+    preds = torch.cat(preds).numpy()
+    cand = [idx for idx, pr in zip(unl, preds) if pr == col]
+    return cand, len(cand)
+
+
+def oracle_results(pool_datamodule, acquired_idx, target_ec):
+    """Wet-lab oracle: for each acquired sequence, does it have the target function?
+
+    Returns (ids, ecs_as_predicted, results). `ecs` is the TARGET label, not the
+    true one, because that is what the experimenter was testing for -- the assay
+    answers 'does this do X', not 'what does this do'. On a False the update path
+    uses that label to push the sequence away from the target EC, which is
+    exactly the information a negative assay carries.
+    """
+    full = pool_datamodule.query_dataset.full_list
+    ids = [full[i] for i in acquired_idx]
+    res = []
+    for _id in ids:
+        true = pool_datamodule.id_ec.get(_id, [])
+        if not isinstance(true, (list, tuple)):
+            true = [true]
+        res.append(target_ec in true)
+    return ids, [target_ec] * len(ids), res
+
+
 def update_dataloader(pool_datamodule, train_datamodule, regime, newly_acquired,
                       replay_ratio=None, replay_selection='uniform_ec', seed=1234):
     """Dataloader for one round's update, per --update_regime.
@@ -427,6 +489,8 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
     # single index_add rather than a Python loop over ECs.
     raw, row_ecs = cache['raw'], cache['row_ecs']
     ecs = sorted(set(row_ecs))
+    # column order for the projection, so an argmax can be mapped back to an EC
+    model._ec_order = ecs
     ec_pos = {ec: i for i, ec in enumerate(ecs)}
     idx_t = torch.tensor([ec_pos[e] for e in row_ecs], device=device, dtype=torch.long)
 
@@ -447,7 +511,7 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
 RANDOM_SEED_FALLBACK = 1234
 
 
-def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec', eval_every=1):
+def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec', eval_every=1, target_ec=None):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
@@ -516,9 +580,50 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
                 model.set_ec_centroids(
                     build_ec_centroids(model, train_datamodule, pool_datamodule, device))
 
+            _restore = None
+            n_cand = None
+            if target_ec is not None:
+                cand, n_cand = target_candidates(model, pool_datamodule, target_ec, device)
+                if len(cand) >= n_instances:
+                    _restore = list(pool_datamodule.unlabeled_indices)
+                    pool_datamodule.unlabeled_indices = cand
+                else:
+                    # Fewer predicted-target sequences than the batch. Take them
+                    # all and top up from the rest of the pool, so the round is
+                    # never starved -- and log it, because a run that spends most
+                    # rounds topping up is telling us the model cannot find the
+                    # target at all.
+                    print(f'[target] only {len(cand)} predicted as {target_ec}; '
+                          f'topping up to {n_instances} from the wider pool')
             indices, scores = al_strat.query(model=model, al_datamodule=pool_datamodule, acq_size=n_instances, return_utilities=True)
+            if _restore is not None:
+                pool_datamodule.unlabeled_indices = _restore
             newly_acquired = list(indices)
             scores = scores.cpu()
+            if target_ec is not None:
+                _ids, _ecs, _res = oracle_results(pool_datamodule, newly_acquired, target_ec)
+                n_yes = sum(1 for r in _res if r)
+                print(f'[target] round {i_cycle}: {len(cand) if n_cand is not None else "?"} predicted, '
+                      f'{n_yes}/{len(_res)} assayed POSITIVE for {target_ec}')
+                save_metrics({'round': i_cycle, 'n_predicted': n_cand, 'ids': _ids,
+                              'results': [bool(r) for r in _res], 'n_yes': n_yes},
+                             save_path + '/round_{}/oracle.json'.format(i_cycle))
+                _ds = pool_datamodule.train_dataset
+                _ds = _ds.dataset if hasattr(_ds, 'dataset') else _ds
+                if hasattr(_ds, 'ids_for_update'):
+                    _prev_i = list(getattr(_ds, 'ids_for_update', None) or [])
+                    _prev_e = list(getattr(_ds, 'ecs_for_update', None) or [])
+                    _prev_r = list(getattr(_ds, 'result_of_experiment', None) or [])
+                    _ds.ids_for_update = _prev_i + _ids
+                    _ds.ecs_for_update = _prev_e + _ecs
+                    _ds.result_of_experiment = _prev_r + [bool(r) for r in _res]
+                    _neg_ids = [i for i, r in zip(_ids, _res) if not r]
+                    if _neg_ids:
+                        mutate_incorrect_seq_ECs(_neg_ids, [False] * len(_neg_ids),
+                                                 name=pool_filename, path=pool_data_path,
+                                                 emb_out_dir=emb_dir)
+                        retrieve_esm1b_embedding(pool_filename + '_incorrect_seq_ECs',
+                                                 path=pool_data_path, emb_out_dir=emb_dir)
 
             print(indices)
             print(scores)
