@@ -617,6 +617,17 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
                     _ds.ids_for_update = _prev_i + _ids
                     _ds.ecs_for_update = _prev_e + _ecs
                     _ds.result_of_experiment = _prev_r + [bool(r) for r in _res]
+                    # Confirmed members of the hunted EC. A negative assay
+                    # anchors on these and pushes the rejected sequence away, so
+                    # the update sharpens the boundary around the target rather
+                    # than nudging one false positive. Empty until the first
+                    # positive assay, which is also when a target centroid first
+                    # exists and the predicted-EC filter starts working.
+                    _ds.target_ec = target_ec
+                    _ds.known_target_ids = [i for i, r in
+                                            zip(_ds.ids_for_update, _ds.result_of_experiment) if r]
+                    print(f'[target] confirmed members of {target_ec} so far: '
+                          f'{len(_ds.known_target_ids)}')
                     _neg_ids = [i for i, r in zip(_ids, _res) if not r]
                     if _neg_ids:
                         mutate_incorrect_seq_ECs(_neg_ids, [False] * len(_neg_ids),
