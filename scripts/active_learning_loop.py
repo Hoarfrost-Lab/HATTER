@@ -142,6 +142,7 @@ def train_CLEAN_model_AL(model, criterion, optimizer, al_strat, train_datamodule
         #ensure_dirs(save_path+'/'+cache_dir+'/recomputed/')
 
         #FIXME - not a priority for simulation
+
     
     save_end_of_training_metrics(model, 
             save_path, 
@@ -300,44 +301,103 @@ def _replay_subset(train_datamodule, n_acquired, ratio, selection, seed):
     return Subset(full, picked[:n_replay])
 
 
-def target_candidates(model, pool_datamodule, target_ec, device):
-    """Pool indices the model currently PREDICTS to be the target EC.
+
+def seed_target(pool_datamodule, target_ec, n_seed, rng_seed=1234):
+    """Pre-label a few known members of the hunted EC before round 0.
+
+    WHY THIS IS REQUIRED, not a convenience. CLEAN predicts by nearest EC
+    centroid, and build_ec_centroids only creates a centroid for an EC that has
+    at least one LABELLED member. The target was deliberately removed from
+    pretraining, so at round 0 it has no centroid, no column in the projection,
+    and therefore cannot be the argmax for any pool sequence. The predicted-EC
+    filter returns an empty shortlist every round, the loop silently falls back
+    to generic acquisition, and the experiment measures nothing it intended.
+    Measured over four runs before this was added: shortlist 0 in all 40 rounds,
+    and positives found at chance (3-8 per 320 assays against 3.2 expected).
+
+    The fix is also the more faithful scenario. Someone hunting a function has at
+    least one known example -- that is how they know it exists. Seeding gives the
+    model a reference point for the target while leaving the encoder ignorant of
+    it, which is exactly the position of a scientist who has just characterised
+    one enzyme and wants more.
+
+    Seeds are marked acquired and recorded as positive assays, so they build the
+    centroid and can anchor negative-assay triplets. They are logged separately
+    so they are never counted as discoveries.
+    """
+    if not target_ec or n_seed <= 0:
+        return []
+    full = pool_datamodule.query_dataset.full_list
+    cand = []
+    for idx in list(pool_datamodule.unlabeled_indices):
+        ecs = pool_datamodule.id_ec.get(full[idx], [])
+        if target_ec in (ecs if isinstance(ecs, (list, tuple)) else [ecs]):
+            cand.append(idx)
+    if not cand:
+        print(f'[seed] WARNING: no {target_ec} members in the pool to seed from')
+        return []
+    rnd = random.Random(rng_seed)
+    chosen = rnd.sample(cand, min(n_seed, len(cand)))
+    pool_datamodule.update_annotations(chosen)
+    print(f'[seed] pre-labelled {len(chosen)} known members of {target_ec} '
+          f'({len(cand)} available); these are NOT counted as discoveries')
+    return chosen
+
+
+def target_candidates(model, pool_datamodule, target_ec, device, min_depth=2):
+    """Pool indices the model predicts to be the target EC, with hierarchical backoff.
 
     This is what makes the target experiment match its use case. A scientist
     hunting one function does not send the globally most uncertain sequences to
     the bench; they send sequences their model thinks ARE the target, and the
-    assay returns yes or no. Acquisition then ranks within that shortlist rather
-    than over the whole pool.
+    assay returns yes or no. Acquisition then ranks within that shortlist.
+
+    BACKOFF BY EC PREFIX. Exact matches on the full EC are preferred, but when
+    none exist the shortlist widens to the same sub-subclass (2.7.7.- for a
+    2.7.7.6 target) and then the same subclass (2.7.-.-). Enzymes sharing three
+    EC levels catalyse closely related chemistry, so that is where the target's
+    undiscovered homologs actually sit -- a far better prior than the topping-up
+    from the whole pool this replaces, which silently turned the run into generic
+    acquisition. Backoff stops at `min_depth` rather than continuing to the top
+    level, because sharing only the first EC digit ("it is a transferase") says
+    almost nothing.
 
     Prediction is argmax over the same negated squared distances to EC centroids
     that the acquisition functions score, so filter and ranking agree by
     construction.
 
-    Returns (candidate_indices, n_predicted). An empty list is meaningful, not an
-    error: it says the model currently believes the target is nowhere in the
-    pool, which is the failure mode this experiment exists to detect.
+    Returns (candidate_indices, n_candidates, depth_used). depth 4 is an exact
+    match, 3 is the sub-subclass, 2 the subclass; None means nothing at or above
+    min_depth, which with seeding in place indicates a real problem rather than
+    a cold start.
     """
     ec_order = getattr(model, '_ec_order', None) or []
-    if target_ec not in ec_order:
-        # No centroid for the target yet -- nothing can be predicted as it.
-        return [], 0
-    col = ec_order.index(target_ec)
-    unl = list(pool_datamodule.unlabeled_indices)
-    if not unl:
-        return [], 0
-    loader = DataLoader(pool_datamodule.query_dataset, batch_size=4096,
-                        sampler=unl, collate_fn=pool_datamodule.collator)
-    preds = []
-    model.eval()
+    if not ec_order or not pool_datamodule.unlabeled_indices:
+        return [], 0, None
+
+    # Use the datamodule's own unlabeled_dataloader and the model's get_logits --
+    # exactly what UncertaintySampling.query does. A hand-rolled DataLoader over
+    # query_dataset was unpacking batches wrong and produced a degenerate forward
+    # pass: all 32,309 pool sequences predicted into class 1.1. Sharing the
+    # acquisition path guarantees the filter and the ranking see the same tensor.
+    loader, unl = pool_datamodule.unlabeled_dataloader()
     with torch.no_grad():
-        for batch in loader:
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-            logits = model(x.to(device))
-            preds.append(logits.argmax(1).cpu())
-    model.train()
-    preds = torch.cat(preds).numpy()
-    cand = [idx for idx, pr in zip(unl, preds) if pr == col]
-    return cand, len(cand)
+        logits = model.get_logits(loader)
+    preds = logits.argmax(1).cpu().numpy()
+    pred_ec = [ec_order[i] if i < len(ec_order) else '' for i in preds]
+    from collections import Counter as _C
+    _pref = _C(".".join(e.split(".")[:2]) for e in pred_ec if e).most_common(3)
+    print(f'[target-dbg] ec_order={len(ec_order)} target_in_order={target_ec in ec_order} '
+          f'n_unlabeled={len(unl)} top-prefixes={_pref}')
+
+    tparts = target_ec.split('.')
+    for depth in range(4, min_depth - 1, -1):
+        want = '.'.join(tparts[:depth])
+        cand = [idx for idx, pe in zip(unl, pred_ec)
+                if pe and '.'.join(pe.split('.')[:depth]) == want]
+        if cand:
+            return cand, len(cand), depth
+    return [], 0, None
 
 
 def oracle_results(pool_datamodule, acquired_idx, target_ec):
@@ -511,7 +571,7 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
 RANDOM_SEED_FALLBACK = 1234
 
 
-def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec', eval_every=1, target_ec=None):
+def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec', eval_every=1, target_ec=None, n_seed_target=0):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
@@ -559,6 +619,18 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
 
     break_early = False
     exit_round = False
+    seeded_ids = []
+    match_tally = {'exact': 0, 'sub-subclass': 0, 'subclass': 0, 'NONE': 0}
+    if target_ec is not None and n_seed_target > 0:
+        _sel = seed_target(pool_datamodule, target_ec, n_seed_target, RANDOM_SEED_FALLBACK)
+        seeded_ids = [pool_datamodule.query_dataset.full_list[j] for j in _sel]
+        apply_labeled_scope(pool_datamodule, train_datamodule)
+        _sd = pool_datamodule.train_dataset
+        _sd = _sd.dataset if hasattr(_sd, 'dataset') else _sd
+        if hasattr(_sd, 'ids_for_update') and seeded_ids:
+            _sd.target_ec = target_ec
+            _sd.known_target_ids = list(seeded_ids)
+
     for i_cycle in range(n_queries+1):
         if break_early:
             exit_round = True
@@ -583,18 +655,28 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
             _restore = None
             n_cand = None
             if target_ec is not None:
-                cand, n_cand = target_candidates(model, pool_datamodule, target_ec, device)
-                if len(cand) >= n_instances:
+                cand, n_cand, _depth = target_candidates(model, pool_datamodule, target_ec, device)
+                _lvl = {4: 'exact', 3: 'sub-subclass', 2: 'subclass'}.get(_depth, 'NONE')
+                if cand:
+                    # Rank within the shortlist even when it is smaller than the
+                    # batch: dal_toolbox returns everything available rather than
+                    # failing, so a short list simply means a short round. That
+                    # is the honest behaviour -- padding from the wider pool is
+                    # what silently turned this into generic acquisition before.
                     _restore = list(pool_datamodule.unlabeled_indices)
                     pool_datamodule.unlabeled_indices = cand
+                    if len(cand) < n_instances:
+                        print(f'[target] shortlist {len(cand)} < batch {n_instances} '
+                              f'({_lvl}); acquiring the whole shortlist')
                 else:
-                    # Fewer predicted-target sequences than the batch. Take them
-                    # all and top up from the rest of the pool, so the round is
-                    # never starved -- and log it, because a run that spends most
-                    # rounds topping up is telling us the model cannot find the
-                    # target at all.
-                    print(f'[target] only {len(cand)} predicted as {target_ec}; '
-                          f'topping up to {n_instances} from the wider pool')
+                    print(f'[target] NO candidates at or above the sub-subclass level for '
+                          f'{target_ec}. With seeding this should not happen; the round '
+                          f'falls back to generic acquisition and is flagged in oracle.json')
+                match_tally[_lvl] = match_tally.get(_lvl, 0) + 1
+                print(f'[target] round {i_cycle}: shortlist={n_cand} match={_lvl}'
+                      f'  [tally exact={match_tally["exact"]} '
+                      f'sub-subclass={match_tally["sub-subclass"]} '
+                      f'subclass={match_tally["subclass"]} none={match_tally["NONE"]}]')
             indices, scores = al_strat.query(model=model, al_datamodule=pool_datamodule, acq_size=n_instances, return_utilities=True)
             if _restore is not None:
                 pool_datamodule.unlabeled_indices = _restore
@@ -603,10 +685,11 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
             if target_ec is not None:
                 _ids, _ecs, _res = oracle_results(pool_datamodule, newly_acquired, target_ec)
                 n_yes = sum(1 for r in _res if r)
-                print(f'[target] round {i_cycle}: {len(cand) if n_cand is not None else "?"} predicted, '
-                      f'{n_yes}/{len(_res)} assayed POSITIVE for {target_ec}')
+                print(f'[target] round {i_cycle}: {n_yes}/{len(_res)} assayed POSITIVE for {target_ec}')
                 save_metrics({'round': i_cycle, 'n_predicted': n_cand, 'ids': _ids,
-                              'results': [bool(r) for r in _res], 'n_yes': n_yes},
+                              'results': [bool(r) for r in _res], 'n_yes': n_yes,
+                              'n_seeded': len(seeded_ids), 'match_depth': _depth,
+                              'match_level': _lvl, 'degraded': bool(not cand)},
                              save_path + '/round_{}/oracle.json'.format(i_cycle))
                 _ds = pool_datamodule.train_dataset
                 _ds = _ds.dataset if hasattr(_ds, 'dataset') else _ds
@@ -624,8 +707,8 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
                     # positive assay, which is also when a target centroid first
                     # exists and the predicted-EC filter starts working.
                     _ds.target_ec = target_ec
-                    _ds.known_target_ids = [i for i, r in
-                                            zip(_ds.ids_for_update, _ds.result_of_experiment) if r]
+                    _ds.known_target_ids = list(seeded_ids) + [
+                        i for i, r in zip(_ds.ids_for_update, _ds.result_of_experiment) if r]
                     print(f'[target] confirmed members of {target_ec} so far: '
                           f'{len(_ds.known_target_ids)}')
                     _neg_ids = [i for i, r in zip(_ids, _res) if not r]
@@ -829,6 +912,20 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
         #exiting due to lack of points to complete round
         if exit_round:
             break
+    if target_ec is not None:
+        _tot = sum(match_tally.values()) or 1
+        print(f'[target] SHORTLIST TIER SUMMARY for {target_ec} over {_tot} rounds:')
+        for _k in ('exact', 'sub-subclass', 'subclass', 'NONE'):
+            print(f'[target]   {_k:14s} {match_tally[_k]:4d} rounds  ({100*match_tally[_k]/_tot:5.1f}%)')
+        if match_tally['exact'] == 0:
+            print('[target]   WARNING: the model NEVER predicted the target exactly. '
+                  'Treat these results as a homolog-neighbourhood search, not target recovery.')
+        save_metrics({'target_ec': target_ec, 'rounds': _tot, 'n_seeded': len(seeded_ids),
+                      'tier_rounds': match_tally,
+                      'frac_exact': match_tally['exact'] / _tot,
+                      'frac_degraded': match_tally['NONE'] / _tot},
+                     save_path + '/target_summary.json')
+
 
     save_end_of_training_metrics(model, 
             save_path, 
