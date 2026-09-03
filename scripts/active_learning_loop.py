@@ -654,18 +654,22 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
 
             _restore = None
             n_cand = None
+            _acq = n_instances
             if target_ec is not None:
                 cand, n_cand, _depth = target_candidates(model, pool_datamodule, target_ec, device)
                 _lvl = {4: 'exact', 3: 'sub-subclass', 2: 'subclass'}.get(_depth, 'NONE')
                 if cand:
-                    # Rank within the shortlist even when it is smaller than the
-                    # batch: dal_toolbox returns everything available rather than
-                    # failing, so a short list simply means a short round. That
-                    # is the honest behaviour -- padding from the wider pool is
-                    # what silently turned this into generic acquisition before.
+                    # Rank within the shortlist. When it is smaller than the
+                    # batch the ROUND SHRINKS -- acq_size must be clamped,
+                    # because the strategy ends in scores.topk(acq_size) and
+                    # torch raises 'selected index k out of range' rather than
+                    # returning what it has. A short round is the honest
+                    # behaviour: padding from the wider pool is what silently
+                    # turned this into generic acquisition before.
                     _restore = list(pool_datamodule.unlabeled_indices)
                     pool_datamodule.unlabeled_indices = cand
-                    if len(cand) < n_instances:
+                    if len(cand) < _acq:
+                        _acq = len(cand)
                         print(f'[target] shortlist {len(cand)} < batch {n_instances} '
                               f'({_lvl}); acquiring the whole shortlist')
                 else:
@@ -677,7 +681,7 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
                       f'  [tally exact={match_tally["exact"]} '
                       f'sub-subclass={match_tally["sub-subclass"]} '
                       f'subclass={match_tally["subclass"]} none={match_tally["NONE"]}]')
-            indices, scores = al_strat.query(model=model, al_datamodule=pool_datamodule, acq_size=n_instances, return_utilities=True)
+            indices, scores = al_strat.query(model=model, al_datamodule=pool_datamodule, acq_size=_acq, return_utilities=True)
             if _restore is not None:
                 pool_datamodule.unlabeled_indices = _restore
             newly_acquired = list(indices)
@@ -686,8 +690,17 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
                 _ids, _ecs, _res = oracle_results(pool_datamodule, newly_acquired, target_ec)
                 n_yes = sum(1 for r in _res if r)
                 print(f'[target] round {i_cycle}: {n_yes}/{len(_res)} assayed POSITIVE for {target_ec}')
+                # Per-ACQUISITION acquisition score, aligned to `ids`. Without
+                # this the only record of model confidence is a truncated tensor
+                # repr in the log, so 'was the model more uncertain about the
+                # batches that failed?' cannot be asked after the fact.
+                try:
+                    _sc = [float(scores[i]) for i in range(len(newly_acquired))]
+                except Exception:
+                    _sc = []
                 save_metrics({'round': i_cycle, 'n_predicted': n_cand, 'ids': _ids,
                               'results': [bool(r) for r in _res], 'n_yes': n_yes,
+                              'scores': _sc, 'score_mean': (sum(_sc)/len(_sc)) if _sc else None,
                               'n_seeded': len(seeded_ids), 'match_depth': _depth,
                               'match_level': _lvl, 'degraded': bool(not cand)},
                              save_path + '/round_{}/oracle.json'.format(i_cycle))

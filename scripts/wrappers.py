@@ -265,7 +265,19 @@ class MyTypiClust(TypiClust):
         unlabeled_dataloader, unlabeled_indices = al_datamodule.unlabeled_dataloader(self.subset_size)
         labeled_dataloader, labeled_indices = al_datamodule.labeled_dataloader()
 
-        num_clusters = min(len(labeled_indices) + acq_size, self.MAX_NUM_CLUSTERS)
+        # Cap the cluster count by the data being clustered, not only by the
+        # labelled count. num_clusters grows with len(labeled_indices) and
+        # ignores how many points there are, so once the candidate pool is small
+        # -- late in a high-coverage sweep, or whenever the caller restricts
+        # unlabeled_indices, as target-directed acquisition does -- it asks for
+        # more clusters than points. The singleton clusters that result give
+        # calculate_typicality k = len(indices)//2 = 0 and NearestNeighbors
+        # raises "Found array with 0 sample(s)". Observed at round 105 of a
+        # 436-round sweep.
+        n_points = len(labeled_indices) + len(unlabeled_indices)
+        num_clusters = min(len(labeled_indices) + acq_size,
+                           self.MAX_NUM_CLUSTERS,
+                           max(1, n_points // 5))
 
         unlabeled_features = model.get_representations(unlabeled_dataloader)
         if len(labeled_indices) > 0:
@@ -298,7 +310,14 @@ class MyTypiClust(TypiClust):
             indices = (labels == cluster).nonzero()[0]
             rel_feats = features[indices]
             # in case we have too small cluster, calculate density among half of the cluster
-            typicality = calculate_typicality(rel_feats, min(self.K_NN, len(indices) // 2))
+            # k must be >= 1: a one- or two-member cluster gives
+            # len(indices)//2 == 0 and NearestNeighbors rejects an empty
+            # neighbourhood. Guard here too, since a degenerate cluster can
+            # survive the num_clusters cap.
+            if len(indices) == 0:
+                continue
+            typicality = calculate_typicality(
+                rel_feats, max(1, min(self.K_NN, len(indices) // 2)))
             #typicality_scores.append(typicality)
             idx = indices[typicality.argmax()]
             selected.append(idx)
