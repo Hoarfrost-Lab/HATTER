@@ -316,8 +316,17 @@ class MyTypiClust(TypiClust):
             # survive the num_clusters cap.
             if len(indices) == 0:
                 continue
-            typicality = calculate_typicality(
-                rel_feats, max(1, min(self.K_NN, len(indices) // 2)))
+            if len(indices) == 1:
+                # singleton cluster: nothing to rank, the lone member is the
+                # pick. Reached whenever the candidate set is restricted (the
+                # target-EC shortlist shrinks to ~10 in late rounds).
+                idx = indices[0]
+                selected.append(idx)
+                labels[idx] = -1
+                continue
+            # k neighbours need k + 1 points to fit against.
+            k = max(1, min(self.K_NN, len(indices) // 2, len(indices) - 1))
+            typicality = calculate_typicality(rel_feats, k)
             #typicality_scores.append(typicality)
             idx = indices[typicality.argmax()]
             selected.append(idx)

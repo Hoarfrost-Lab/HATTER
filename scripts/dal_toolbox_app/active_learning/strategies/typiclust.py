@@ -14,6 +14,9 @@ from dal_toolbox.models.utils.base import BaseModule
 
 def get_nn(features, num_neighbors):
     features = features.numpy().astype(np.float32)
+    # the query point occupies one of the n_neighbors slots and is dropped
+    # below, so the fit set must hold num_neighbors + 1 points.
+    num_neighbors = max(1, min(num_neighbors, len(features) - 1))
     nn_calculator = NearestNeighbors(n_neighbors=num_neighbors + 1, metric='sqeuclidean', n_jobs=-1).fit(features)
     distances, indices = nn_calculator.kneighbors(features)
 
@@ -30,6 +33,11 @@ def get_mean_nn_dist(features, num_neighbors, return_indices=False):
 
 
 def calculate_typicality(features, num_neighbors):
+    if len(features) < 2:
+        # a lone point has no neighbourhood, so typicality is undefined rather
+        # than zero; return it uniform so an argmax still selects the only
+        # candidate instead of raising.
+        return np.ones(len(features), dtype=np.float32)
     mean_distance = get_mean_nn_dist(features, num_neighbors)
     # low distance to NN is high density
     typicality = 1 / (mean_distance + 1e-5)
