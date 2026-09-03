@@ -385,43 +385,122 @@ class MyBadge(Query):
         
         return indices, total_p / len(X)
 
+# ---------------------------------------------------------------------------#
+# Pool-size guard
+#
+# Every acquisition strategy carries at least one size hyperparameter fixed at
+# construction: acq_size per round, subset_size for the strategies that
+# subsample, num_clusters derived from the labelled count. None of them know how
+# large the candidate pool actually is, and all three raise cryptically when it
+# is smaller than they assume:
+#
+#   scores.topk(acq_size)                -> "selected index k out of range"
+#   rng.choice(..., replace=False)       -> "Cannot take a larger sample than
+#                                            population"
+#   kmeans into more clusters than points -> singleton clusters, then
+#                                            "Found array with 0 sample(s)" in
+#                                            NearestNeighbors
+#
+# That is reachable in ordinary use -- late in a high-coverage sweep, or whenever
+# the caller restricts the unlabelled set, as target-directed acquisition does by
+# filtering to sequences predicted to be the target EC. Rather than patch each
+# strategy, wrap them: one place, every strategy, and the failure becomes either
+# a clamp or an explicit error depending on what the caller asked for.
+# ---------------------------------------------------------------------------#
+
+POOL_SIZE_POLICY = 'clamp'   # set from --pool_size_policy in driver.py
+
+
+class PoolSizeGuard(Query):
+    """Clamp a strategy's size hyperparameters to the pool actually available.
+
+    policy='clamp' (default) shrinks the round and logs it: acquiring fewer
+    sequences than requested is the honest outcome when fewer exist, and is what
+    a deployment would do.
+
+    policy='error' refuses instead, for callers who would rather stop than
+    silently take a short round -- appropriate when the batch size is the
+    experimental variable and a short round would confound it.
+    """
+
+    def __init__(self, inner, policy='clamp'):
+        super().__init__(random_seed=getattr(inner, 'random_seed', None))
+        if policy not in ('clamp', 'error'):
+            raise ValueError(f"policy must be 'clamp' or 'error', got {policy!r}")
+        self.inner = inner
+        self.policy = policy
+
+    def __getattr__(self, name):          # delegate anything we do not define
+        return getattr(self.__dict__['inner'], name)
+
+    def query(self, *, model, al_datamodule, acq_size, **kwargs):
+        n_avail = len(al_datamodule.unlabeled_indices)
+        if n_avail == 0:
+            raise ValueError('No unlabelled instances remain to acquire from.')
+
+        if acq_size > n_avail:
+            if self.policy == 'error':
+                raise ValueError(
+                    f'acq_size={acq_size} exceeds the {n_avail} unlabelled instances '
+                    f'available. Pass a smaller --n_instances, or use '
+                    f'--pool_size_policy clamp to acquire what remains.')
+            print(f'[pool-guard] acq_size {acq_size} > {n_avail} available; '
+                  f'acquiring {n_avail}')
+            acq_size = n_avail
+
+        # subset_size is read inside the strategy, so it has to be clamped on the
+        # object rather than passed through. Restored afterwards so a short round
+        # does not permanently shrink the strategy.
+        original = getattr(self.inner, 'subset_size', None)
+        if original is not None and original > n_avail:
+            print(f'[pool-guard] subset_size {original} > {n_avail} available; '
+                  f'using {n_avail} for this round')
+            self.inner.subset_size = n_avail
+        try:
+            return self.inner.query(model=model, al_datamodule=al_datamodule,
+                                    acq_size=acq_size, **kwargs)
+        finally:
+            if original is not None:
+                self.inner.subset_size = original
+
+
 def get_sampling_active_learner(query_strategy='uncertainty'):
     if query_strategy == 'uncertainty':
-        return LeastConfidentSampling()
+        return PoolSizeGuard(LeastConfidentSampling(), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'entropy':
-        return EntropySampling()
+        return PoolSizeGuard(EntropySampling(), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'margin':
-        return MarginSampling()
+        return PoolSizeGuard(MarginSampling(), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'random':
-        return RandomSampling()
+        return PoolSizeGuard(RandomSampling(), policy=POOL_SIZE_POLICY)
     else:
         raise ValueError('Please specify a valid query strategy')
 
 def get_badge_active_learner():
-    return MyBadge(subset_size=10000)
+    return PoolSizeGuard(MyBadge(subset_size=10000), policy=POOL_SIZE_POLICY)
 
 def get_committee_active_learner(learners_list=[LeastConfidentSampling(), EntropySampling(), MarginSampling()]):
-    return QBC(learners_list)
+    return PoolSizeGuard(QBC(learners_list), policy=POOL_SIZE_POLICY)
 
 def get_bayesian_active_learner(query_strategy='uncertainty'):
     if query_strategy == 'uncertainty':
-        return BayesianLeastConfidentSampling(subset_size=10000)
+        return PoolSizeGuard(BayesianLeastConfidentSampling(subset_size=10000), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'entropy':
-        return BayesianEntropySampling(subset_size=10000)
+        return PoolSizeGuard(BayesianEntropySampling(subset_size=10000), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'margin':
-        return BayesianMarginSampling(subset_size=10000)
+        return PoolSizeGuard(BayesianMarginSampling(subset_size=10000), policy=POOL_SIZE_POLICY)
     else:
         raise ValueError('Please specify a valid query strategy')
 
 def get_bald_active_learner(batch=False): #currently ignoring batch option -- maybe in future release
     if batch:
-        return BatchBALDSampling(subset_size=10000)
+        return PoolSizeGuard(BatchBALDSampling(subset_size=10000), policy=POOL_SIZE_POLICY)
         
-    return BALDSampling(subset_size=10000)
+    return PoolSizeGuard(BALDSampling(subset_size=10000), policy=POOL_SIZE_POLICY)
 
 def get_clust_active_learner():
-    return MyTypiClust(subset_size=10000)
+    return PoolSizeGuard(MyTypiClust(subset_size=10000), policy=POOL_SIZE_POLICY)
 
 def get_bio_active_learner(seq_path=None, learners_list=[LeastConfidentSampling(), EntropySampling(), MarginSampling()]):
-    return BioInspiredSampling(learners_list, seq_path, subset_size=10000)
+    return PoolSizeGuard(BioInspiredSampling(learners_list, seq_path, subset_size=10000), policy=POOL_SIZE_POLICY)
 

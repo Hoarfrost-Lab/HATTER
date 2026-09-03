@@ -71,6 +71,7 @@ if __name__ == "__main__":
     parser.add_argument('--convert_from_nucleotides', action='store_true', help='Convert sequence column to amino acids if necessary for selected model')
     parser.add_argument('--generate_plots', action='store_true', help='Specifies if plots should be generated after each query iteration')
     parser.add_argument('--target_ec', type=str, default=None, help="Run the TARGET-DIRECTED protocol for this EC instead of generic acquisition. Each round the pool is first filtered to sequences the model PREDICTS to be this EC, acquisition ranks within that shortlist, and the oracle returns a yes/no assay result rather than an EC number. A yes trains the sequence toward the EC; a no pushes it away, using a masked self-variant as the positive and a true member of the EC as the negative. This is the scenario a scientist hunting one function is actually in, and it is not the same experiment as generic uncertainty sampling over the whole pool.")
+    parser.add_argument('--pool_size_policy', type=str, default='clamp', choices=['clamp', 'error'], help="What to do when a strategy's size hyperparameters exceed the unlabelled pool. Reachable in ordinary use: late in a high-coverage sweep, or whenever the candidate set is restricted, as --target_ec does. 'clamp' (default) shrinks the round to what is available and logs it, which is what a deployment would do. 'error' refuses instead -- appropriate when the batch size is the experimental variable and a short round would confound it. Without this guard the failures are cryptic: topk raises 'selected index k out of range', rng.choice raises 'Cannot take a larger sample than population', and TypiClust clusters into more groups than it has points and dies inside NearestNeighbors.")
     parser.add_argument('--n_seed_target', type=int, default=0, help="Pre-label this many known members of --target_ec before round 0. REQUIRED for the target protocol to function: the target has no EC centroid until something carrying it is labelled, so with 0 seeds the predicted-EC filter returns an empty shortlist every round and the run silently degrades to generic acquisition. Seeds are recorded as positive assays so they build the centroid and can anchor negative-assay triplets, and are logged separately so they are never counted as discoveries.")
     parser.add_argument('--eval_every', type=int, default=1, help="Evaluate on the test sets every Nth round instead of every round. Default 1 preserves the existing behaviour exactly. Per-round evaluation infers 60,135 test sequences and rebuilds the reference set, which is ~95%% of a round's wall time, so a full-pool sweep at batch 384 costs 25h at N=1 and about 3h at N=10 while still yielding 44 points on the curve. The final round is ALWAYS evaluated regardless of N, so the endpoint is never lost.")
     parser.add_argument('--checkpoint_and_eval', action='store_true', help='Whether to save intermediary checkpoints based on evaluation dataset performance')
@@ -150,6 +151,10 @@ if __name__ == "__main__":
     #prepares active learning wrapped model
     if args.mode != 'inference' and not args.perform_pretraining:
         model = DeterministicCLEANModel(model, loss_fn=criterion, optimizer=optimizer, bayesian=mc_dropout)
+        # set before the learner is constructed: PoolSizeGuard reads the module
+        # global at construction time, not per query
+        import wrappers as _w
+        _w.POOL_SIZE_POLICY = args.pool_size_policy
         learner = setup_CLEAN_active_learning_model(active_type=args.active_type)
         if args.acquisition_space == 'distance':
             model._use_distance_logits = True
