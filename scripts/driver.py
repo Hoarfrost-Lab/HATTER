@@ -47,7 +47,8 @@ if __name__ == "__main__":
     parser.add_argument('--active_type', type=str, choices=['uncertainty_sampling', 'entropy_sampling', 'margin_sampling', 'random_sampling', 'bayesian', 'BALD', 'BADGE', 'typiclust', 'QBC', 'bio-inspired'], required=True, help='Type of embedding to use')
     parser.add_argument('--train_csv_path', type=str, required=True, help='Path to the train CSV file')
     parser.add_argument('--pool_csv_path', type=str, help='Path to the unlabeled pool CSV file')
-    parser.add_argument('--embedding_type', type=str, choices=['lookingglassv2', 'evo', 'esm1b', 'esm2', 'protgpt2'], default='esm1b', help='Type of embedding to use')
+    parser.add_argument('--embedding_type', type=str, choices=['lookingglassv2', 'evo', 'esm1b', 'esm2', 'esmc', 'protgpt2'], default='esm1b', help='Type of embedding to use. esm2/esmc also require HATTER_EMBEDDER in the environment so cached embeddings are computed with the same encoder (see clean_app utils.retrieve_esm1b_embedding).')
+    parser.add_argument('--input_size', type=int, default=None, help='Encoder embedding width. Default: 1280 for esm1b/esm2, 1152 for esmc (600M; pass 960 for esmc_300m).')
     parser.add_argument('--network_type', type=str, choices=['standard', 'sngp', 'cnn', 'instancenorm', 'layernorm', 'batchnorm'], default='layernorm', help='Type of embedding to use')
     parser.add_argument('--loss', type=str, choices=['triplet', 'supconh', 'himulcone'], default='triplet', help='Type of loss to use')
     parser.add_argument('--distmap_type', type=str, choices=['pvalue', 'maxsep'], default='maxsep', help='How to calculate distmap')
@@ -113,12 +114,16 @@ if __name__ == "__main__":
     #set the embedding size hardcoded based on transformer training
     if args.embedding_type == 'esm2' or args.embedding_type == 'esm1b':
         input_size = 1280 #esm - change if loading smaller/larger checkpoint
+    elif args.embedding_type == 'esmc':
+        input_size = 1152 #esmc_600m; esmc_300m is 960
     elif args.embedding_type == 'protgpt2':
         input_size = 1280 #gpt
     elif args.embedding_type == 'evo':
         input_size = 512 #evo
     else:
         input_size = 768 #bert models
+    if args.input_size is not None:
+        input_size = args.input_size
     
     if args.loss == 'triplet':
         criterion = torch.nn.TripletMarginLoss(margin=1, reduction='mean')
@@ -434,6 +439,7 @@ if __name__ == "__main__":
                                         eval_every=args.eval_every,
                                         target_ec=args.target_ec,
                                         n_seed_target=args.n_seed_target,
+                                        seed=args.seed,
                                         update_regime=args.update_regime,
                                         reference_set=args.reference_set,
                                         replay_ratio=args.replay_ratio,

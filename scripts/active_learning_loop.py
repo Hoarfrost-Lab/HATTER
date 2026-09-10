@@ -571,7 +571,7 @@ def build_ec_centroids(model, train_datamodule, pool_datamodule, device):
 RANDOM_SEED_FALLBACK = 1234
 
 
-def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec', eval_every=1, target_ec=None, n_seed_target=0):
+def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, train_datamodule, pool_datamodule, eval_dataloader=None, n_instances=32, n_queries=3, generate_plots=False, save_path='.', adaptive_rate=100, learning_rate=0.0001, checkpoint_and_eval=False, train_data_path='./', eval_data_path='./', pool_data_path='./', train_filename='train', eval_filename='eval', pool_filename='./', pca=None, label_encoder=None, plot_tuple=None, save_recomputed_embeddings=False, maxsep=True, loss='triplet', model_name='CLEAN', metrics_save_path='training_metrics.json', emb_dir='/emb_data/', cache_dir='/distance_map/', clip_norm=False, temp=0.1, n_pos=9, _format_esm=False, test_data_list=[], update_regime='scratch', reference_set='train', replay_ratio=None, replay_selection='uniform_ec', eval_every=1, target_ec=None, n_seed_target=0, seed=RANDOM_SEED_FALLBACK):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     device = torch.device(device)
@@ -622,7 +622,7 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
     seeded_ids = []
     match_tally = {'exact': 0, 'sub-subclass': 0, 'subclass': 0, 'NONE': 0}
     if target_ec is not None and n_seed_target > 0:
-        _sel = seed_target(pool_datamodule, target_ec, n_seed_target, RANDOM_SEED_FALLBACK)
+        _sel = seed_target(pool_datamodule, target_ec, n_seed_target, seed)
         seeded_ids = [pool_datamodule.query_dataset.full_list[j] for j in _sel]
         apply_labeled_scope(pool_datamodule, train_datamodule)
         _sd = pool_datamodule.train_dataset
@@ -751,7 +751,7 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
         #train one epoch
         #____________________________________________________________________#
         for i, item in enumerate(update_dataloader(pool_datamodule, train_datamodule, update_regime, newly_acquired,
-                                                  replay_ratio, replay_selection, RANDOM_SEED_FALLBACK)):
+                                                  replay_ratio, replay_selection, seed)):
             batch_loss = train_step(item, device, optimizer, model, criterion, clip_norm=clip_norm, temp=temp, n_pos=n_pos)
             epoch_loss += batch_loss
 
@@ -936,7 +936,8 @@ def run_CLEAN_active_learning_simulation(model, criterion, optimizer, al_strat, 
         save_metrics({'target_ec': target_ec, 'rounds': _tot, 'n_seeded': len(seeded_ids),
                       'tier_rounds': match_tally,
                       'frac_exact': match_tally['exact'] / _tot,
-                      'frac_degraded': match_tally['NONE'] / _tot},
+                      'frac_degraded': match_tally['NONE'] / _tot,
+                      'seed': seed, 'seeded_ids': list(seeded_ids)},
                      save_path + '/target_summary.json')
 
 

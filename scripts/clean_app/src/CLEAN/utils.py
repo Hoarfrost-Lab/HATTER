@@ -159,8 +159,14 @@ def retrieve_esm1b_embedding(name, path='./', emb_out_dir='/emb_data/'):
     Embeddings are keyed by sequence id, so skipping is safe: an id's embedding
     depends only on its sequence.
     """
+    # Which encoder. esm1b is the published default; esm2 uses the same fair-esm
+    # extractor and .pt layout (mean representation, layer 33); esmc runs
+    # scripts/esmc_extract.py under a separate conda env (HATTER_ESMC_PYTHON),
+    # because the EvolutionaryScale `esm` package shadows fair-esm's module
+    # name. esmc writes bare tensors, which format_esm passes through.
+    embedder = os.environ.get("HATTER_EMBEDDER", "esm1b")
     esm_script = "esm/scripts/extract.py"
-    esm_type = "esm1b_t33_650M_UR50S"
+    esm_type = {"esm1b": "esm1b_t33_650M_UR50S", "esm2": "esm2_t33_650M_UR50D"}.get(embedder, "esm1b_t33_650M_UR50S")
     esm_out = path+'/'+emb_out_dir
     fasta_name = path+"/" + name + ".fasta"
 
@@ -191,8 +197,12 @@ def retrieve_esm1b_embedding(name, path='./', emb_out_dir='/emb_data/'):
                 fh.writelines(body)
         print(f"  {len(todo)}/{len(records)} embeddings missing for {name}, embedding those only")
 
-    command = ["python", esm_script, esm_type,
-              fasta_name, esm_out, "--include", "mean"]
+    if embedder == "esmc":
+        command = [os.environ.get("HATTER_ESMC_PYTHON", "python"), "esmc_extract.py",
+                   os.environ.get("HATTER_ESMC_MODEL", "esmc_600m"), fasta_name, esm_out]
+    else:
+        command = ["python", esm_script, esm_type,
+                   fasta_name, esm_out, "--include", "mean"]
     result = subprocess.run(command)
     if result.returncode != 0:
         raise RuntimeError(
