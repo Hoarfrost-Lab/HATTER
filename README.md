@@ -148,3 +148,13 @@ The above steps can be repeated for any number of rounds assuming appropriate po
 - If additional problems with environment occur please reach out to the authors and we will be happy to assist you!
 
 
+
+**Changes since publication**
+
+The configuration used for the paper is tagged `v1.0-paper`. Bug fixes and
+new options merged after it are listed in [CHANGELOG.md](CHANGELOG.md), which
+separates changes that alter the default code path (QBC disagreement,
+simulation-mode contrastive mining, `--precomputed`, MC-dropout masking,
+pool-size clamping) from opt-in additions behind new flags. Re-running a
+published configuration on current `main` may differ in those respects;
+check out the tag to reproduce the paper exactly.
