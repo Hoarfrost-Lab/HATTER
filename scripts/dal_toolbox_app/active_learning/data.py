@@ -74,6 +74,14 @@ class ActiveLearningDataModule(L.LightningDataModule):
         """Returns a dataloader for the unlabeled pool where instances are not augmentated."""
         unlabeled_indices = self.unlabeled_indices
         if subset_size is not None:
+            # Clamp to the pool actually available. A strategy's subset_size is a
+            # fixed hyperparameter, but the caller may have restricted
+            # unlabeled_indices -- target-directed acquisition filters it to the
+            # sequences predicted to be the target EC -- and rng.choice with
+            # replace=False then raises "Cannot take a larger sample than
+            # population". Subsampling fewer than requested is the intended
+            # behaviour when fewer exist.
+            subset_size = min(subset_size, len(unlabeled_indices))
             unlabeled_indices = self.rng.choice(unlabeled_indices, size=subset_size, replace=False)
             unlabeled_indices = unlabeled_indices.tolist()
         loader = DataLoader(self.query_dataset, batch_size=self.predict_batch_size,

@@ -85,6 +85,11 @@ class Active_learning_triplet_dataset_with_mine_EC(Triplet_dataset_with_mine_EC)
         self.ids_for_update = ids_for_update
         self.ecs_for_update = ecs_for_update
         self.result_of_experiment = result_of_experiment
+        # Confirmed members of the hunted EC, grown by positive assays. Used by
+        # the negative-assay branch to anchor on the target cluster instead of
+        # on the rejected sequence.
+        self.known_target_ids = []
+        self.target_ec = None
 
         self.path = path
         self.emb_out_dir = emb_out_dir
@@ -92,6 +97,13 @@ class Active_learning_triplet_dataset_with_mine_EC(Triplet_dataset_with_mine_EC)
         self.query_dataset = False #only set if query dataset is activated in dataloader
 
         self.sorted_ids = sorted(list(self.id_ec.keys()))
+        # Contrastive mining scope. When set via set_labeled_scope(), positives
+        # and negatives come ONLY from train plus already-acquired pool points,
+        # never from unlabelled pool entries.
+        self.labeled_id_ec = None
+        self.labeled_ec_id = None
+        self.labeled_mine_neg = None
+
 
         for ec in ec_id.keys():
             if '-' not in ec:
@@ -102,8 +114,74 @@ class Active_learning_triplet_dataset_with_mine_EC(Triplet_dataset_with_mine_EC)
             incorrect_fasta_file = mutate_incorrect_seq_ECs(ids_for_update, result_of_experiment, path=path, name=name, emb_out_dir=emb_out_dir)
             retrieve_esm1b_embedding(incorrect_fasta_file, path=path, emb_out_dir=emb_out_dir)
 
+    def set_labeled_scope(self, labeled_ids, train_id_ec=None, train_ec_id=None):
+        """Restrict contrastive mining to train + already-acquired pool points.
+
+        Without this, __getitem__ mines positives and negatives from the pool's
+        full id_ec/ec_id maps. Training anchors are correctly restricted to the
+        labelled subset by the datamodule, but a negative drawn from an
+        UNLABELLED pool entry uses that entry's EC label to establish it as a
+        valid negative -- the label of data the model has not acquired.
+        Hard-negative mining makes this worse than random: it selects the
+        nearest wrong-EC neighbours, the most informative subset. The effect
+        grows with pool size and would read as an active-learning gain.
+
+        The deployed update path already avoids this via train_tuple; simulation
+        was the odd one out. train_tuple alone is NOT sufficient, because
+        random_positive wraps its train branch in try/except and falls back to
+        pool mining for an anchor absent from train -- exactly the novel-EC
+        case. Restricting the maps closes that path properly.
+
+        Call after every update_annotations().
+        """
+        labeled = set(labeled_ids)
+        id_ec, ec_id = {}, {}
+
+        def _add(_id, ecs):
+            if not ecs:
+                return
+            ecs = [ecs] if isinstance(ecs, str) else list(ecs)
+            id_ec[_id] = ecs
+            for ec in ecs:
+                ec_id.setdefault(ec, set()).add(_id)
+
+        if train_id_ec:
+            for _id, ecs in train_id_ec.items():
+                _add(_id, ecs)
+        for _id in labeled:
+            _add(_id, self.id_ec.get(_id))
+
+        self.labeled_id_ec = id_ec
+        self.labeled_ec_id = {k: sorted(v) for k, v in ec_id.items()}
+
+        # Filter the mined-negative table to ECs inside the labelled scope,
+        # renormalising sampling weights over what survives.
+        filtered = {}
+        for ec, entry in (self.mine_neg or {}).items():
+            if ec not in ec_id:
+                continue
+            negs = entry["negative"] if isinstance(entry, dict) else entry
+            weights = entry.get("weights") if isinstance(entry, dict) else None
+            keep = [(n, (weights[i] if weights is not None else 1.0))
+                    for i, n in enumerate(negs) if n in ec_id]
+            if not keep:
+                continue
+            ns, ws = zip(*keep)
+            total = float(sum(ws)) or 1.0
+            filtered[ec] = {"negative": list(ns),
+                            "weights": [w / total for w in ws]}
+        self.labeled_mine_neg = filtered
+
     def __len__(self):
         return len(self.full_list)
+
+    def _triplet(self, a_id, p_id, n_id, a_ec):
+        a = torch.load(self.path + self.emb_out_dir + a_id + '.pt')
+        p = torch.load(self.path + self.emb_out_dir + p_id + '.pt')
+        n = torch.load(self.path + self.emb_out_dir + n_id + '.pt')
+        if self.return_anchor:
+            return format_esm(a), format_esm(p), format_esm(n), (a_id, a_ec)
+        return format_esm(a), format_esm(p), format_esm(n)
 
     def __getitem__(self, index):
         if self.ids_for_update == None: #standard training
@@ -114,8 +192,27 @@ class Active_learning_triplet_dataset_with_mine_EC(Triplet_dataset_with_mine_EC)
                 anchor_ec = self.full_list[index]
                 anchor = random.choice(self.ec_id[anchor_ec])
 
-            pos = random_positive(anchor, self.id_ec, self.ec_id)
-            neg = mine_negative(anchor, self.id_ec, self.ec_id, self.mine_neg)
+            if self.labeled_id_ec is not None:
+                # Mine only within train + acquired. random_positive already
+                # falls back to a mutated self-variant when the anchor's EC has
+                # exactly one member, which is the right behaviour for an EC
+                # just acquired for the first time: it self-mutates until a
+                # second real example arrives.
+                scope_id_ec = self.labeled_id_ec
+                scope_ec_id = self.labeled_ec_id
+                scope_neg = self.labeled_mine_neg
+                if anchor not in scope_id_ec:
+                    # Never silently widen to the unlabelled pool.
+                    scope_id_ec = {anchor: self.id_ec.get(anchor, [])}
+                    scope_ec_id = {}
+                    scope_neg = {}
+            else:
+                scope_id_ec = self.id_ec
+                scope_ec_id = self.ec_id
+                scope_neg = self.mine_neg
+
+            pos = random_positive(anchor, scope_id_ec, scope_ec_id)
+            neg = mine_negative(anchor, scope_id_ec, scope_ec_id, scope_neg)
 
         else: #trying specifically to target queried sequence ids from the previous round
             anchor = self.sorted_ids[index] #should always be a query dataset if we get here
@@ -126,13 +223,46 @@ class Active_learning_triplet_dataset_with_mine_EC(Triplet_dataset_with_mine_EC)
                     result = _result
                     break
 
-            if result: #result is correct continue with normal model update #FIXME -- should probably be train_ec_id but complicates how I currently update the ids
+            if result: #assay POSITIVE: the sequence really does have this function
                 pos = random_positive(anchor, self.id_ec, self.ec_id, train_tuple=(self.train_id_ec, self.train_ec_id))
                 neg = mine_negative(anchor, self.id_ec, self.ec_id, self.mine_neg, train_tuple=(self.train_id_ec, self.train_ec_id, self.mine_neg_train))
-            
-            else: #result is incorrect - set positive as negative and mutate sequence for new positive
+
+            else:
+                # ASSAY NEGATIVE. Reformulated -- see the two problems with the
+                # original, which was: anchor=X, pos=X_masked, neg=random member
+                # of self.id_ec[X].
+                #
+                # 1. LEAKAGE AND WRONG DIRECTION. random_positive(X, id_ec, ...)
+                #    resolves to a member of X's OWN TRUE EC, because it looks up
+                #    id_ec[X]. So it pushed X away from its own real function,
+                #    using a label the assay never returned. The assay says only
+                #    "not the target"; X's true EC is unknown to the experimenter.
+                #
+                # 2. A DEGENERATE POSITIVE. d(X, X_masked) is a self-consistency
+                #    term carrying almost no information, and it anchors X to
+                #    where it already is.
+                #
+                # The reformulation makes the TARGET cluster the anchor and the
+                # rejected sequence the negative, so a failed assay sharpens the
+                # boundary around the function being hunted instead of nudging
+                # one false positive. Both remaining terms are informative: pull
+                # two confirmed members together, push the rejected one away.
+                known = [k for k in (self.known_target_ids or []) if k != anchor]
+                if len(known) >= 2:
+                    a2, p2 = random.sample(known, 2)
+                    return self._triplet(a2, p2, anchor, self.target_ec)
+                if len(known) == 1:
+                    # One confirmed member: it can still anchor, with its own
+                    # masked variant as the positive.
+                    return self._triplet(known[0], known[0] + '_' + str(random.randint(0, 9)),
+                                         anchor, self.target_ec)
+                # No confirmed member of the target yet. A negative assay against
+                # a function the model has no representation of carries nothing a
+                # contrastive update can use, so fall back to the original
+                # self-consistency form rather than inventing a direction. These
+                # examples are dropped upstream where possible.
                 pos = anchor + '_' + str(random.randint(0, 9))
-                neg = random_positive(anchor, self.id_ec, self.ec_id)
+                neg = pos
 
         a = torch.load(self.path+self.emb_out_dir+anchor+'.pt')
         p = torch.load(self.path+self.emb_out_dir+pos+'.pt')

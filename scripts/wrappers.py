@@ -89,16 +89,40 @@ class QBC(Query):
         disagreement = self.calculate_disagreement(scores_list.detach().cpu().numpy(), logits.shape[0])
         return torch.from_numpy(disagreement).to(self.device)
 
-    #based on modAL package's KL-max-disagreement
     def calculate_disagreement(self, scores_list, X_shape):
-        p_consensus = np.mean(scores_list, axis=1)
-        learner_KL_div = np.zeros(shape=(X_shape, len(self.learners_list)))
+        """Committee disagreement per pool instance.
 
-        #for learner_idx, _ in enumerate(self.learners_list):
-        for i in range(X_shape):
-            learner_KL_div[i, :] = entropy(np.transpose(scores_list[:, i]), qk=np.transpose(p_consensus))
+        scores_list is (L, N): one utility per committee member per instance.
 
-        return np.max(learner_KL_div, axis=1)
+        The previous implementation had three defects, none of which raised:
+          1. `np.mean(scores_list, axis=1)` averaged each MEMBER across the
+             whole pool, giving an (L,) pool-level constant rather than the
+             (N,) per-instance consensus the cited modAL method needs. It also
+             made a score depend on pool composition, which drifts every AL
+             round.
+          2. `entropy(pk, qk)` on two length-L vectors returns a SCALAR, which
+             then broadcast across the whole `learner_KL_div[i, :]` row, so the
+             per-member axis carried no information and the final
+             `np.max(..., axis=1)` reduced over identical copies.
+          3. Members return utilities on incommensurable scales (measured:
+             LeastConfident 0-0.50, Entropy 0-0.69, Margin 0-1.00), and
+             `scipy.stats.entropy` renormalises them, so the result tracked
+             scale artefacts. Empirically this INVERTED the ordering: the
+             committee selected the most confident instances.
+
+        Fix: z-score each member across the pool to put them on a common scale,
+        then disagreement is the spread of member opinions on each instance.
+        Scale-invariant and genuinely per-instance. (Correcting only the axis
+        also restores the right ordering, but leaves the largest-range member
+        dominating the max.)
+        """
+        scores_list = np.asarray(scores_list, dtype=np.float64)
+
+        mu = scores_list.mean(axis=1, keepdims=True)
+        sd = scores_list.std(axis=1, keepdims=True) + 1e-12
+        z = (scores_list - mu) / sd
+
+        return z.std(axis=0)
 
 
 class BioInspiredSampling(Query):
@@ -185,16 +209,40 @@ class BioInspiredSampling(Query):
         disagreement = self.calculate_disagreement(scores_list.detach().cpu().numpy(), logits.shape[0])
         return torch.from_numpy(disagreement).to(self.device)
 
-    #based on modAL package's KL-max-disagreement
     def calculate_disagreement(self, scores_list, X_shape):
-        p_consensus = np.mean(scores_list, axis=1)
-        learner_KL_div = np.zeros(shape=(X_shape, len(self.learners_list)))
+        """Committee disagreement per pool instance.
 
-        #for learner_idx, _ in enumerate(self.learners_list):
-        for i in range(X_shape):
-            learner_KL_div[i, :] = entropy(np.transpose(scores_list[:, i]), qk=np.transpose(p_consensus))
+        scores_list is (L, N): one utility per committee member per instance.
 
-        return np.max(learner_KL_div, axis=1)
+        The previous implementation had three defects, none of which raised:
+          1. `np.mean(scores_list, axis=1)` averaged each MEMBER across the
+             whole pool, giving an (L,) pool-level constant rather than the
+             (N,) per-instance consensus the cited modAL method needs. It also
+             made a score depend on pool composition, which drifts every AL
+             round.
+          2. `entropy(pk, qk)` on two length-L vectors returns a SCALAR, which
+             then broadcast across the whole `learner_KL_div[i, :]` row, so the
+             per-member axis carried no information and the final
+             `np.max(..., axis=1)` reduced over identical copies.
+          3. Members return utilities on incommensurable scales (measured:
+             LeastConfident 0-0.50, Entropy 0-0.69, Margin 0-1.00), and
+             `scipy.stats.entropy` renormalises them, so the result tracked
+             scale artefacts. Empirically this INVERTED the ordering: the
+             committee selected the most confident instances.
+
+        Fix: z-score each member across the pool to put them on a common scale,
+        then disagreement is the spread of member opinions on each instance.
+        Scale-invariant and genuinely per-instance. (Correcting only the axis
+        also restores the right ordering, but leaves the largest-range member
+        dominating the max.)
+        """
+        scores_list = np.asarray(scores_list, dtype=np.float64)
+
+        mu = scores_list.mean(axis=1, keepdims=True)
+        sd = scores_list.std(axis=1, keepdims=True) + 1e-12
+        z = (scores_list - mu) / sd
+
+        return z.std(axis=0)
 
 class MyTypiClust(TypiClust):
     #adjusted parameters here
@@ -217,7 +265,19 @@ class MyTypiClust(TypiClust):
         unlabeled_dataloader, unlabeled_indices = al_datamodule.unlabeled_dataloader(self.subset_size)
         labeled_dataloader, labeled_indices = al_datamodule.labeled_dataloader()
 
-        num_clusters = min(len(labeled_indices) + acq_size, self.MAX_NUM_CLUSTERS)
+        # Cap the cluster count by the data being clustered, not only by the
+        # labelled count. num_clusters grows with len(labeled_indices) and
+        # ignores how many points there are, so once the candidate pool is small
+        # -- late in a high-coverage sweep, or whenever the caller restricts
+        # unlabeled_indices, as target-directed acquisition does -- it asks for
+        # more clusters than points. The singleton clusters that result give
+        # calculate_typicality k = len(indices)//2 = 0 and NearestNeighbors
+        # raises "Found array with 0 sample(s)". Observed at round 105 of a
+        # 436-round sweep.
+        n_points = len(labeled_indices) + len(unlabeled_indices)
+        num_clusters = min(len(labeled_indices) + acq_size,
+                           self.MAX_NUM_CLUSTERS,
+                           max(1, n_points // 5))
 
         unlabeled_features = model.get_representations(unlabeled_dataloader)
         if len(labeled_indices) > 0:
@@ -250,7 +310,23 @@ class MyTypiClust(TypiClust):
             indices = (labels == cluster).nonzero()[0]
             rel_feats = features[indices]
             # in case we have too small cluster, calculate density among half of the cluster
-            typicality = calculate_typicality(rel_feats, min(self.K_NN, len(indices) // 2))
+            # k must be >= 1: a one- or two-member cluster gives
+            # len(indices)//2 == 0 and NearestNeighbors rejects an empty
+            # neighbourhood. Guard here too, since a degenerate cluster can
+            # survive the num_clusters cap.
+            if len(indices) == 0:
+                continue
+            if len(indices) == 1:
+                # singleton cluster: nothing to rank, the lone member is the
+                # pick. Reached whenever the candidate set is restricted (the
+                # target-EC shortlist shrinks to ~10 in late rounds).
+                idx = indices[0]
+                selected.append(idx)
+                labels[idx] = -1
+                continue
+            # k neighbours need k + 1 points to fit against.
+            k = max(1, min(self.K_NN, len(indices) // 2, len(indices) - 1))
+            typicality = calculate_typicality(rel_feats, k)
             #typicality_scores.append(typicality)
             idx = indices[typicality.argmax()]
             selected.append(idx)
@@ -318,43 +394,122 @@ class MyBadge(Query):
         
         return indices, total_p / len(X)
 
+# ---------------------------------------------------------------------------#
+# Pool-size guard
+#
+# Every acquisition strategy carries at least one size hyperparameter fixed at
+# construction: acq_size per round, subset_size for the strategies that
+# subsample, num_clusters derived from the labelled count. None of them know how
+# large the candidate pool actually is, and all three raise cryptically when it
+# is smaller than they assume:
+#
+#   scores.topk(acq_size)                -> "selected index k out of range"
+#   rng.choice(..., replace=False)       -> "Cannot take a larger sample than
+#                                            population"
+#   kmeans into more clusters than points -> singleton clusters, then
+#                                            "Found array with 0 sample(s)" in
+#                                            NearestNeighbors
+#
+# That is reachable in ordinary use -- late in a high-coverage sweep, or whenever
+# the caller restricts the unlabelled set, as target-directed acquisition does by
+# filtering to sequences predicted to be the target EC. Rather than patch each
+# strategy, wrap them: one place, every strategy, and the failure becomes either
+# a clamp or an explicit error depending on what the caller asked for.
+# ---------------------------------------------------------------------------#
+
+POOL_SIZE_POLICY = 'clamp'   # set from --pool_size_policy in driver.py
+
+
+class PoolSizeGuard(Query):
+    """Clamp a strategy's size hyperparameters to the pool actually available.
+
+    policy='clamp' (default) shrinks the round and logs it: acquiring fewer
+    sequences than requested is the honest outcome when fewer exist, and is what
+    a deployment would do.
+
+    policy='error' refuses instead, for callers who would rather stop than
+    silently take a short round -- appropriate when the batch size is the
+    experimental variable and a short round would confound it.
+    """
+
+    def __init__(self, inner, policy='clamp'):
+        super().__init__(random_seed=getattr(inner, 'random_seed', None))
+        if policy not in ('clamp', 'error'):
+            raise ValueError(f"policy must be 'clamp' or 'error', got {policy!r}")
+        self.inner = inner
+        self.policy = policy
+
+    def __getattr__(self, name):          # delegate anything we do not define
+        return getattr(self.__dict__['inner'], name)
+
+    def query(self, *, model, al_datamodule, acq_size, **kwargs):
+        n_avail = len(al_datamodule.unlabeled_indices)
+        if n_avail == 0:
+            raise ValueError('No unlabelled instances remain to acquire from.')
+
+        if acq_size > n_avail:
+            if self.policy == 'error':
+                raise ValueError(
+                    f'acq_size={acq_size} exceeds the {n_avail} unlabelled instances '
+                    f'available. Pass a smaller --n_instances, or use '
+                    f'--pool_size_policy clamp to acquire what remains.')
+            print(f'[pool-guard] acq_size {acq_size} > {n_avail} available; '
+                  f'acquiring {n_avail}')
+            acq_size = n_avail
+
+        # subset_size is read inside the strategy, so it has to be clamped on the
+        # object rather than passed through. Restored afterwards so a short round
+        # does not permanently shrink the strategy.
+        original = getattr(self.inner, 'subset_size', None)
+        if original is not None and original > n_avail:
+            print(f'[pool-guard] subset_size {original} > {n_avail} available; '
+                  f'using {n_avail} for this round')
+            self.inner.subset_size = n_avail
+        try:
+            return self.inner.query(model=model, al_datamodule=al_datamodule,
+                                    acq_size=acq_size, **kwargs)
+        finally:
+            if original is not None:
+                self.inner.subset_size = original
+
+
 def get_sampling_active_learner(query_strategy='uncertainty'):
     if query_strategy == 'uncertainty':
-        return LeastConfidentSampling()
+        return PoolSizeGuard(LeastConfidentSampling(), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'entropy':
-        return EntropySampling()
+        return PoolSizeGuard(EntropySampling(), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'margin':
-        return MarginSampling()
+        return PoolSizeGuard(MarginSampling(), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'random':
-        return RandomSampling()
+        return PoolSizeGuard(RandomSampling(), policy=POOL_SIZE_POLICY)
     else:
         raise ValueError('Please specify a valid query strategy')
 
 def get_badge_active_learner():
-    return MyBadge(subset_size=10000)
+    return PoolSizeGuard(MyBadge(subset_size=10000), policy=POOL_SIZE_POLICY)
 
 def get_committee_active_learner(learners_list=[LeastConfidentSampling(), EntropySampling(), MarginSampling()]):
-    return QBC(learners_list)
+    return PoolSizeGuard(QBC(learners_list), policy=POOL_SIZE_POLICY)
 
 def get_bayesian_active_learner(query_strategy='uncertainty'):
     if query_strategy == 'uncertainty':
-        return BayesianLeastConfidentSampling(subset_size=10000)
+        return PoolSizeGuard(BayesianLeastConfidentSampling(subset_size=10000), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'entropy':
-        return BayesianEntropySampling(subset_size=10000)
+        return PoolSizeGuard(BayesianEntropySampling(subset_size=10000), policy=POOL_SIZE_POLICY)
     elif query_strategy == 'margin':
-        return BayesianMarginSampling(subset_size=10000)
+        return PoolSizeGuard(BayesianMarginSampling(subset_size=10000), policy=POOL_SIZE_POLICY)
     else:
         raise ValueError('Please specify a valid query strategy')
 
 def get_bald_active_learner(batch=False): #currently ignoring batch option -- maybe in future release
     if batch:
-        return BatchBALDSampling(subset_size=10000)
+        return PoolSizeGuard(BatchBALDSampling(subset_size=10000), policy=POOL_SIZE_POLICY)
         
-    return BALDSampling(subset_size=10000)
+    return PoolSizeGuard(BALDSampling(subset_size=10000), policy=POOL_SIZE_POLICY)
 
 def get_clust_active_learner():
-    return MyTypiClust(subset_size=10000)
+    return PoolSizeGuard(MyTypiClust(subset_size=10000), policy=POOL_SIZE_POLICY)
 
 def get_bio_active_learner(seq_path=None, learners_list=[LeastConfidentSampling(), EntropySampling(), MarginSampling()]):
-    return BioInspiredSampling(learners_list, seq_path, subset_size=10000)
+    return PoolSizeGuard(BioInspiredSampling(learners_list, seq_path, subset_size=10000), policy=POOL_SIZE_POLICY)
 

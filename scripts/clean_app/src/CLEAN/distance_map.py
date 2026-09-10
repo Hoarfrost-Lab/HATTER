@@ -136,3 +136,40 @@ def get_random_nk_dist_map(emb_train, rand_nk_emb_train,
         random_nk_dist_map = dist_map_helper(
             rand_nk_ids, rand_nk_emb_train, ecs, model_lookup)
     return random_nk_dist_map
+
+
+def get_topk_dist_test(model_emb_train, model_emb_test, ec_id_dict_train,
+                       id_ec_test, device, dtype, k=10, chunk=4096):
+    """Top-k nearest EC cluster centres per test sequence, vectorised.
+
+    get_dist_map_test builds a nested dict of every (test_id, EC) distance --
+    for 50,789 test sequences against 4,637 ECs that is 235 MILLION Python dict
+    entries, which is then turned into a DataFrame and immediately reduced to
+    `nsmallest(10)` per column by write_max_sep_choices. Everything downstream
+    reads only the resulting CSV, and maximum_separation only ever inspects
+    those 10 values, so the full map is pure waste: minutes per evaluation and
+    tens of GB, versus milliseconds here.
+
+    This matters because the AL simulation evaluates EVERY round.
+
+    Returns (test_ids, ec_names, topk_vals, topk_idx) with distances ascending.
+    Distances are plain L2, matching dist_map_helper (get_dist_map_test defaults
+    to dot=False).
+    """
+    cluster_center_model = get_cluster_center(model_emb_train, ec_id_dict_train)
+    ecs = list(cluster_center_model.keys())
+    lookup = torch.stack([cluster_center_model[ec] for ec in ecs]).to(
+        device=device, dtype=dtype)
+
+    test_ids = list(id_ec_test.keys())
+    k = min(k, len(ecs))
+
+    vals, idxs = [], []
+    for start in range(0, model_emb_test.shape[0], chunk):
+        block = model_emb_test[start:start + chunk].to(device=device, dtype=dtype)
+        d = torch.cdist(block, lookup)                     # (chunk, n_ec)
+        v, i = torch.topk(d, k, dim=1, largest=False, sorted=True)
+        vals.append(v.cpu())
+        idxs.append(i.cpu())
+
+    return test_ids, ecs, torch.cat(vals).numpy(), torch.cat(idxs).numpy()

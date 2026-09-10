@@ -21,6 +21,14 @@ from dataloader import create_CLEAN_dataloader
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
 def reinit_CLEAN(epoch, adaptive_rate, num_epochs, optimizer, learning_rate, model, checkpoint_dir, model_name, train_dataloader, train_emb, dtype, train_data_path, batch_size, shuffle, knn, loss, _format_esm, active_learning_mode=False):
+    # `device` was referenced below but never defined in this scope and is not a
+    # parameter -- the signature takes dtype only. The call fires every
+    # adaptive_rate epochs (default 100), so short runs never reach it: the AL
+    # simulation does one epoch per round and never gets past epoch 40. Any
+    # training run longer than 100 epochs dies with
+    #   NameError: name 'device' is not defined
+    # Derived here the same way the rest of the codebase does.
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model.train()
     if epoch % adaptive_rate == 0 and epoch != num_epochs + 1 and epoch != 0:
         optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, betas=(0.9, 0.999))

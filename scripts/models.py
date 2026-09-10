@@ -497,6 +497,14 @@ class MyConsistentMCDropout2d(ConsistentMCDropout2d):
             mask = self.mask
 
         k = input.shape[0]
+        if mask.shape[1] < k:
+            # The cached mask was built for an EARLIER, SMALLER batch and
+            # narrow() can only shrink. This is reachable whenever an
+            # evaluation batch exceeds the training batch -- with a 9,997
+            # sequence training set and a 50,789 sequence test set it fires on
+            # the first eval. Rebuild at the larger size and re-cache.
+            self.mask = self._create_mask(input, k)
+            mask = self.mask
         if mask.shape[1] != k:
             mask = mask.narrow(1,0,k)
 

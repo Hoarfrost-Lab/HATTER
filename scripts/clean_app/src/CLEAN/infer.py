@@ -101,15 +101,20 @@ def infer_maxsep(train_data, test_data, model=None, report_metrics = False, pret
     emb_train = model(train_emb)
         
     emb_test = model_embedding_test(id_ec_test, model, device, dtype, path=test_path, emb_out_dir=emb_out_dir, _format_esm=_format_esm)
-    eval_dist = get_dist_map_test(emb_train, emb_test, ec_id_dict_train, id_ec_test, device, dtype)
-    
+    # Fast path: only the 10 nearest ECs per query are ever used downstream
+    # (maximum_separation inspects exactly those), so build them directly
+    # instead of materialising the full (n_test x n_ec) nested dict. See
+    # get_topk_dist_test for why this matters in an AL loop.
+    test_ids, ec_names, topk_vals, topk_idx = get_topk_dist_test(
+        emb_train, emb_test, ec_id_dict_train, id_ec_test, device, dtype)
+
     if not train_mode:
         seed_everything()
-    
-    eval_df = pd.DataFrame.from_dict(eval_dist)
+
     ensure_dirs(out_dir)
     out_filename = out_dir +'/'+ test_data
-    write_max_sep_choices(eval_df, out_filename, gmm=gmm)
+    write_max_sep_choices_topk(test_ids, ec_names, topk_vals, topk_idx,
+                               out_filename, gmm=gmm)
     
     if return_filename:
         return out_dir+'/'+test_data+'_maxsep.csv'
