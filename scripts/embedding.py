@@ -53,8 +53,15 @@ def get_tokenizer_and_encoder(embedding_type='esm1b'):
         model = GPT2Model.from_pretrained("nferruz/ProtGPT2")
         model.eval()
 
+    #ESM-C: embeddings are always read from the on-disk cache written by
+    #esmc_extract.py (see clean_app utils.retrieve_esm1b_embedding), and the
+    #EvolutionaryScale package cannot be imported next to fair-esm, so there is
+    #no in-process encoder.
+    elif embedding_type == 'esmc':
+        tokenizer, model = None, None
+
     else:
-        raise ValueError(f"Invalid embedding type: {self.embedding_type}")
+        raise ValueError(f"Invalid embedding type: {embedding_type}")
 
     return tokenizer, model
 
@@ -70,8 +77,15 @@ def generate_embeddings(embedding_type, sequences, tokenizer, path='./', emb_out
         embs = generate_evo_embeddings(sequences, tokenizer, encoder, device, batch_size=batch_size, tokenize_only=tokenize_only)
     elif embedding_type == 'protgpt2':
         embs = generate_protgpt2_embeddings(sequences, tokenizer, encoder, device, batch_size=batch_size, tokenize_only=tokenize_only)
+    #ESM-C: embeddings are always read from the on-disk cache written by
+    #esmc_extract.py (see clean_app utils.retrieve_esm1b_embedding), and the
+    #EvolutionaryScale package cannot be imported next to fair-esm, so there is
+    #no in-process encoder.
+    elif embedding_type == 'esmc':
+        tokenizer, model = None, None
+
     else:
-        raise ValueError(f"Invalid embedding type: {self.embedding_type}")
+        raise ValueError(f"Invalid embedding type: {embedding_type}")
     
     if emb_out_dir is not None: 
         for seq_id, emb in zip(seq_ids, embs):
