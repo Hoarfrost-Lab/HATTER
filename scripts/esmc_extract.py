@@ -6,7 +6,14 @@ encoder's cache: fair-esm writes {'mean_representations': {33: tensor}} and
 `format_esm` unwraps it; this writes the tensor itself, which `format_esm`
 passes through unchanged.
 
-    python esmc_extract.py esmc_600m sequences.fasta out_dir [--batch-tokens N]
+    python esmc_extract.py esmc_600m sequences.fasta out_dir [--layer 30] [--batch-tokens N]
+
+Which layer: NOT the model's final output. On an EC-stratified sample of
+TEACUP-30 (40 ECs, train_ecdef -> test_closed, cosine 1-NN EC accuracy) the
+final `embeddings` scored 0.34 and the CLS token 0.31, while hidden layers
+19-31 scored 0.65-0.71 (layer 30 best, 0.705; ESM-1b layer 33 on the same
+sample: 0.655). See analysis/diag_esmc_layers.py in LearningDynamicsAL. The
+default is therefore hidden_states[30], mean over residues.
 
 Must run under an environment with the EvolutionaryScale `esm` package
 (`pip install esm`), NOT fair-esm: both import as `esm`. Mean pooling is over
@@ -46,6 +53,8 @@ def main():
     ap.add_argument("--batch-tokens", type=int, default=16000,
                     help="max residues per forward batch (sequences are length-sorted)")
     ap.add_argument("--max-len", type=int, default=1022, help="truncate longer sequences")
+    ap.add_argument("--layer", type=int, default=30,
+                    help="hidden_states index to pool (default 30); -1 = the model's final embeddings output")
     a = ap.parse_args()
 
     from esm.models.esmc import ESMC
@@ -72,7 +81,11 @@ def main():
             batch = recs[i:j]
             toks = model._tokenize([s for _, s in batch]).to(dev)      # padded [B, L+2]
             out = model(sequence_tokens=toks)
-            emb = out.embeddings                                       # [B, L+2, D]
+            if a.layer < 0:
+                emb = out.embeddings                                   # [B, L+2, D] final output
+            else:
+                H = out.hidden_states
+                emb = (H[a.layer] if isinstance(H, (list, tuple)) else H[a.layer])
             for k, (sid, seq) in enumerate(batch):
                 L = len(seq)
                 v = emb[k, 1:L + 1].float().mean(dim=0).cpu()          # residues only
@@ -82,7 +95,7 @@ def main():
                 el = time.time() - t0
                 print(f"  {done:,}/{len(recs):,}  {done/el:.1f} seq/s  "
                       f"ETA {(len(recs)-done)/max(done/el,1e-9)/60:.1f} min", flush=True)
-    print(f"=== esmc_extract done: {done:,} sequences, dim {v.numel()}, {(time.time()-t0)/60:.1f} min ===")
+    print(f"=== esmc_extract done: {done:,} sequences, dim {v.numel()}, layer {a.layer}, {(time.time()-t0)/60:.1f} min ===")
     return 0
 
 
